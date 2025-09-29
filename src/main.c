@@ -234,13 +234,13 @@ void Vec_drop(Vec *this)
 #define BTREEMAP_MINIMUM_CHILD_COUNT (BTREEMAP_MINIMUM_KEY_COUNT + 1)
 #define BTREEMAP_MAXIMUM_CHILD_COUNT (BTREEMAP_MAXIMUM_KEY_COUNT + 1)
 
-typedef struct _BTreeMapNode
+typedef struct __BTreeMapNode
 {
     bool is_leaf;
     size_t key_count;
     void *keys[BTREEMAP_MAXIMUM_KEY_COUNT];
     void *values[BTREEMAP_MAXIMUM_KEY_COUNT];
-    struct _BTreeMapNode *children[BTREEMAP_MAXIMUM_CHILD_COUNT];
+    struct __BTreeMapNode *children[BTREEMAP_MAXIMUM_CHILD_COUNT];
 } _BTreeMapNode;
 
 typedef struct
@@ -761,6 +761,199 @@ void BTreeMap_drop(BTreeMap *this)
     free(this->root);
 }
 
+// [LinkedList]
+
+#include <stddef.h>
+
+#define ROUND_SIZE_UP_TO_ALIGN(size, align) (((size + align - 1) / align) * align)
+#define ROUND_SIZE_UP_TO_MAX_ALIGN(size) ROUND_SIZE_UP_TO_ALIGN(size, _Alignof(max_align_t))
+
+typedef struct _LinkedListNode
+{
+    struct _LinkedListNode *next;
+    struct _LinkedListNode *previous;
+} LinkedListNode;
+
+typedef struct
+{
+    size_t element_size;
+    void (*drop)(void *this);
+} LinkedListElementProps;
+
+typedef struct
+{
+    size_t length;
+    LinkedListNode *head;
+    LinkedListNode *tail;
+    LinkedListElementProps element_props;
+} LinkedList;
+
+static void *_LinkedListNode_get_data(LinkedListNode *this)
+{
+    return (void *)((uintptr_t)(this) + ROUND_SIZE_UP_TO_MAX_ALIGN(sizeof(*this)));
+}
+
+static void _LinkedList_drop_element(LinkedList *this, void *element)
+{
+    if (this->element_props.drop)
+    {
+        this->element_props.drop(element);
+    }
+}
+
+void LinkedList_new(LinkedList *this, const LinkedListElementProps *element_props)
+{
+    this->element_props = *element_props;
+
+    this->length = 0;
+    this->head = NULL;
+    this->tail = NULL;
+}
+
+size_t LinkedList_len(const LinkedList *this)
+{
+    return this->length;
+}
+
+static void _LinkedList_insert_after(LinkedList *this, LinkedListNode *position, LinkedListNode *new_node)
+{
+    bool insert_at_head = position == NULL;
+    if (insert_at_head)
+    {
+        new_node->previous = NULL;
+
+        bool list_is_empty = this->head == NULL;
+        if (list_is_empty)
+        {
+            new_node->next = NULL;
+
+            this->head = new_node;
+            this->tail = new_node;
+        }
+        else
+        {
+            new_node->next = this->head;
+            this->head->previous = new_node;
+            this->head = new_node;
+        }
+    }
+    else
+    {
+        new_node->next = position->next;
+        new_node->previous = position;
+
+        bool insert_after_tail = position->next == NULL;
+        if (insert_after_tail)
+        {
+            this->tail = new_node;
+        }
+        else
+        {
+            position->next->previous = new_node;
+        }
+
+        position->next = new_node;
+    }
+
+    this->length++;
+}
+
+static void _LinkedList_remove(LinkedList *this, LinkedListNode *position)
+{
+    if (position->previous)
+    {
+        position->previous->next = position->next;
+    }
+    else
+    {
+        this->head = position->next;
+    }
+
+    if (position->next)
+    {
+        position->next->previous = position->previous;
+    }
+    else
+    {
+        this->tail = position->previous;
+    }
+
+    _LinkedList_drop_element(this, _LinkedListNode_get_data(position));
+    free(position);
+
+    this->length--;
+}
+
+void LinkedList_push_front(LinkedList *this, const void *value)
+{
+    LinkedListNode *new_node = malloc(ROUND_SIZE_UP_TO_MAX_ALIGN(sizeof(LinkedListNode)) + this->element_props.element_size);
+
+    memcpy(_LinkedListNode_get_data(new_node), value, this->element_props.element_size);
+
+    _LinkedList_insert_after(this, NULL, new_node);
+}
+
+void LinkedList_push_back(LinkedList *this, const void *value)
+{
+    LinkedListNode *new_node = malloc(ROUND_SIZE_UP_TO_MAX_ALIGN(sizeof(LinkedListNode)) + this->element_props.element_size);
+
+    memcpy(_LinkedListNode_get_data(new_node), value, this->element_props.element_size);
+
+    _LinkedList_insert_after(this, this->tail, new_node);
+}
+
+void LinkedList_pop_front(LinkedList *this)
+{
+    if (this->head != NULL)
+    {
+        _LinkedList_remove(this, this->head);
+    }
+}
+
+void LinkedList_pop_back(LinkedList *this)
+{
+    if (this->tail != NULL)
+    {
+        _LinkedList_remove(this, this->tail);
+    }
+}
+
+void *LinkedList_front(LinkedList *this)
+{
+    if (this->head == NULL)
+    {
+        return NULL;
+    }
+    else
+    {
+        return _LinkedListNode_get_data(this->head);
+    }
+}
+
+void *LinkedList_back(LinkedList *this)
+{
+    if (this->tail == NULL)
+    {
+        return NULL;
+    }
+    else
+    {
+        return _LinkedListNode_get_data(this->tail);
+    }
+}
+
+void LinkedList_drop(LinkedList *this)
+{
+    for (LinkedListNode *current = this->head; current != NULL;)
+    {
+        _LinkedList_drop_element(this, _LinkedListNode_get_data(current));
+
+        LinkedListNode *next = current->next;
+        free(current);
+        current = next;
+    }
+}
+
 #include <stdint.h>
 #include <assert.h>
 
@@ -778,6 +971,11 @@ int32_t compare_u8(const uint8_t *a, const uint8_t *b)
     {
         return -1;
     }
+}
+
+void drop_pod(void *element)
+{
+    (void)element;
 }
 
 int main(int argc, const char **argv)
@@ -899,6 +1097,56 @@ int main(int argc, const char **argv)
         assert(value == NULL);
 
         BTreeMap_drop(&u8u8map);
+    }
+
+    {
+        LinkedListElementProps element_props;
+        element_props.element_size = sizeof(uint8_t);
+        element_props.drop = drop_pod;
+
+        LinkedList list;
+        LinkedList_new(&list, &element_props);
+
+        uint8_t value = 10;
+        LinkedList_push_front(&list, &value);
+        value = 20;
+        LinkedList_push_back(&list, &value);
+        value = 30;
+        LinkedList_push_back(&list, &value);
+
+        assert(LinkedList_len(&list) == 3);
+
+        uint8_t *front = LinkedList_front(&list);
+        assert(front && *front == 10);
+
+        uint8_t *back = LinkedList_back(&list);
+        assert(back && *back == 30);
+
+        LinkedList_pop_front(&list);
+        front = LinkedList_front(&list);
+        assert(front && *front == 20);
+        assert(LinkedList_len(&list) == 2);
+
+        LinkedList_pop_back(&list);
+        back = LinkedList_back(&list);
+        assert(back && *back == 20);
+        assert(LinkedList_len(&list) == 1);
+
+        LinkedList_pop_back(&list);
+        assert(LinkedList_len(&list) == 0);
+        assert(LinkedList_front(&list) == NULL);
+        assert(LinkedList_back(&list) == NULL);
+
+        value = 10;
+        LinkedList_push_back(&list, &value);
+        value = 20;
+        LinkedList_push_back(&list, &value);
+
+        assert(LinkedList_len(&list) == 2);
+        assert(*((uint8_t *)LinkedList_front(&list)) == 10);
+        assert(*((uint8_t *)LinkedList_back(&list)) == 20);
+
+        LinkedList_drop(&list);
     }
 
     return 0;
