@@ -1120,6 +1120,143 @@ void VecDeque_drop(VecDeque *this)
     free(this->data);
 }
 
+// [BinaryHeap]
+
+#define PARENT(i) ((i - 1) / 2)
+#define LEFT(i) ((2 * i) + 1)
+#define RIGHT(i) (LEFT(i) + 1)
+
+typedef struct
+{
+    size_t size;
+    void (*drop)(void *this);
+    int32_t (*compare)(const void *a, const void *b);
+} BinaryHeapElementProps;
+
+typedef struct
+{
+    Vec *buffer;
+    BinaryHeapElementProps element_props;
+} BinaryHeap;
+
+void BinaryHeap_new(BinaryHeap *this, const BinaryHeapElementProps *element_props)
+{
+    this->element_props = *element_props;
+
+    this->buffer = malloc(sizeof(*this->buffer));
+
+    VecElementOps ops;
+    ops.drop = this->element_props.drop;
+    Vec_new(this->buffer, this->element_props.size, &ops);
+}
+
+static void _BinaryHeap_swap(const BinaryHeap *this, size_t idx_a, size_t idx_b)
+{
+    uint8_t tmp[this->element_props.size];
+
+    memcpy(tmp, Vec_get(this->buffer, idx_a), this->element_props.size);
+    memcpy(Vec_get_mut(this->buffer, idx_a), Vec_get(this->buffer, idx_b), this->element_props.size);
+    memcpy(Vec_get_mut(this->buffer, idx_b), tmp, this->element_props.size);
+}
+
+static void _BinaryHeap_sift_up(BinaryHeap *this, size_t i)
+{
+    while (i > 0)
+    {
+        size_t parent = PARENT(i);
+
+        if (this->element_props.compare(Vec_get(this->buffer, i), Vec_get(this->buffer, parent)) <= 0)
+        {
+            break;
+        }
+
+        _BinaryHeap_swap(this, i, parent);
+        i = parent;
+    }
+}
+
+static void _BinaryHeap_sift_down(BinaryHeap *this, size_t i)
+{
+    size_t length = Vec_len(this->buffer);
+
+    while (true)
+    {
+        size_t left = LEFT(i);
+        size_t right = RIGHT(i);
+
+        size_t largest = i;
+
+        if (left < length && this->element_props.compare(Vec_get(this->buffer, left), Vec_get(this->buffer, largest)) > 0)
+        {
+            largest = left;
+        }
+
+        if (right < length && this->element_props.compare(Vec_get(this->buffer, right), Vec_get(this->buffer, largest)) > 0)
+        {
+            largest = right;
+        }
+
+        if (largest == i)
+        {
+            break;
+        }
+
+        _BinaryHeap_swap(this, i, largest);
+        i = largest;
+    }
+}
+
+const void *BinaryHeap_peek(const BinaryHeap *this)
+{
+    if (Vec_len(this->buffer) == 0)
+    {
+        return NULL;
+    }
+    else
+    {
+        return Vec_get(this->buffer, 0);
+    }
+}
+
+void *BinaryHeap_peek_mut(BinaryHeap *this)
+{
+    return (void *)BinaryHeap_peek(this);
+}
+
+void BinaryHeap_push(BinaryHeap *this, const void *value)
+{
+    Vec_push(this->buffer, value);
+
+    _BinaryHeap_sift_up(this, Vec_len(this->buffer) - 1);
+}
+
+void BinaryHeap_pop(BinaryHeap *this)
+{
+    if (Vec_len(this->buffer) == 0)
+    {
+        return;
+    }
+
+    _BinaryHeap_swap(this, 0, Vec_len(this->buffer) - 1);
+    Vec_pop(this->buffer);
+
+    if (Vec_len(this->buffer) > 0)
+    {
+        _BinaryHeap_sift_down(this, 0);
+    }
+}
+
+size_t BinaryHeap_len(const BinaryHeap *this)
+{
+    return Vec_len(this->buffer);
+}
+
+void BinaryHeap_drop(BinaryHeap *this)
+{
+    Vec_drop(this->buffer);
+    free(this->buffer);
+}
+
 #include <stdint.h>
 
 int32_t compare_u8(const uint8_t *a, const uint8_t *b)
@@ -1360,6 +1497,64 @@ int main(int argc, const char **argv)
         assert(VecDeque_len(&deque) == 0);
 
         VecDeque_drop(&deque);
+    }
+
+    {
+        BinaryHeap heap;
+        BinaryHeapElementProps props = {
+            .size = sizeof(uint8_t),
+            .drop = drop_pod,
+            .compare = compare_u8,
+        };
+
+        BinaryHeap_new(&heap, &props);
+
+        assert(BinaryHeap_len(&heap) == 0);
+        assert(BinaryHeap_peek(&heap) == NULL);
+
+        uint8_t v = 10;
+        BinaryHeap_push(&heap, &v);
+
+        v = 5;
+        BinaryHeap_push(&heap, &v);
+
+        v = 30;
+        BinaryHeap_push(&heap, &v);
+
+        v = 20;
+        BinaryHeap_push(&heap, &v);
+
+        assert(BinaryHeap_len(&heap) == 4);
+
+        const uint8_t *top = BinaryHeap_peek(&heap);
+        assert(top != NULL && *top == 30);
+
+        BinaryHeap_pop(&heap);
+        assert(BinaryHeap_len(&heap) == 3);
+        top = BinaryHeap_peek(&heap);
+        assert(top != NULL && *top == 20);
+
+        BinaryHeap_pop(&heap);
+        assert(BinaryHeap_len(&heap) == 2);
+        top = BinaryHeap_peek(&heap);
+        assert(top != NULL && *top == 10);
+
+        BinaryHeap_pop(&heap);
+        assert(BinaryHeap_len(&heap) == 1);
+        top = BinaryHeap_peek(&heap);
+        assert(top != NULL && *top == 5);
+
+        BinaryHeap_pop(&heap);
+        assert(BinaryHeap_len(&heap) == 0);
+        assert(BinaryHeap_peek(&heap) == NULL);
+
+        v = 42;
+        BinaryHeap_push(&heap, &v);
+        assert(BinaryHeap_len(&heap) == 1);
+        top = BinaryHeap_peek(&heap);
+        assert(top != NULL && *top == 42);
+
+        BinaryHeap_drop(&heap);
     }
 
     return 0;
