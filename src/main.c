@@ -1,12 +1,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 // [Vec]
 
 typedef struct
 {
-    void (*clone)(void *this, const void *src);
     void (*drop)(void *this);
 } VecElementOps;
 
@@ -18,19 +18,6 @@ typedef struct
     void *data;
     VecElementOps element_ops;
 } Vec;
-
-static void _Vec_clone_element(Vec *this, void *dst, const void *src)
-{
-    if (this->element_ops.clone)
-    {
-        this->element_ops.clone(dst, src);
-    }
-    else
-    {
-        // Assume element is POD and make a shallow copy
-        memcpy(dst, src, this->element_size);
-    }
-}
 
 static void _Vec_drop_element(Vec *this, void *element)
 {
@@ -47,7 +34,6 @@ void Vec_new(Vec *this, size_t element_size, const VecElementOps *element_ops)
 
     if (element_ops == NULL)
     {
-        this->element_ops.clone = NULL;
         this->element_ops.drop = NULL;
     }
     else
@@ -88,14 +74,6 @@ void *Vec_get_mut(Vec *this, size_t i)
     return (void *)Vec_get(this, i);
 }
 
-void Vec_set(Vec *this, size_t i, const void *value)
-{
-    void *element = Vec_get_mut(this, i);
-
-    _Vec_drop_element(this, element);
-    _Vec_clone_element(this, element, value);
-}
-
 void Vec_push(Vec *this, const void *value)
 {
     if (this->length == this->capacity)
@@ -106,7 +84,7 @@ void Vec_push(Vec *this, const void *value)
         this->capacity = new_capacity;
     }
 
-    _Vec_clone_element(this, Vec_get_mut(this, this->length), value);
+    memcpy(Vec_get_mut(this, this->length), value, this->element_size);
 
     this->length++;
 }
@@ -142,7 +120,7 @@ void Vec_insert(Vec *this, size_t i, const void *value)
         const size_t elements_to_move = this->length - i;
         memmove(Vec_get_mut(this, i + 1), new_element_address, elements_to_move * this->element_size);
 
-        _Vec_clone_element(this, new_element_address, value);
+        memcpy(new_element_address, value, this->element_size);
 
         this->length++;
     }
@@ -954,8 +932,195 @@ void LinkedList_drop(LinkedList *this)
     }
 }
 
+// [VecDeque]
+
+#define MIN(a, b) (a < b ? a : b)
+
+typedef struct
+{
+    size_t size;
+    void (*drop)(void *this);
+} VecDequeElementProps;
+
+typedef struct
+{
+    size_t length;
+    size_t capacity;
+    void *data;
+    size_t head;
+    VecDequeElementProps element_props;
+} VecDeque;
+
+void VecDeque_new(VecDeque *this, const VecDequeElementProps *element_props)
+{
+    this->element_props = *element_props;
+
+    this->length = 0;
+    this->capacity = 0;
+    this->data = NULL;
+}
+
+size_t VecDeque_len(const VecDeque *this)
+{
+    return this->length;
+}
+
+size_t VecDeque_capacity(const VecDeque *this)
+{
+    return this->capacity;
+}
+
+static uint8_t *_VecDeque_get(const VecDeque *this, size_t index)
+{
+    return (uint8_t *)(this->data) + (index * this->element_props.size);
+}
+
+void *VecDeque_front(VecDeque *this)
+{
+    if (this->length > 0)
+    {
+        return _VecDeque_get(this, this->head);
+    }
+    else
+    {
+        return NULL;
+    }
+}
+
+void *VecDeque_back(VecDeque *this)
+{
+    if (this->length > 0)
+    {
+        size_t tail_index = (this->head + this->length - 1) % this->capacity;
+        return _VecDeque_get(this, tail_index);
+    }
+    else
+    {
+        return NULL;
+    }
+}
+
+static void _VecDeque_grow_buffer(VecDeque *this)
+{
+    assert(this->length == this->capacity);
+
+    size_t new_capacity = this->capacity ? this->capacity * 2 : 10;
+    void *new_data = malloc(new_capacity * this->element_props.size);
+
+    if (this->capacity)
+    {
+        size_t right = this->capacity - this->head;
+        memcpy(new_data, VecDeque_front(this), right * this->element_props.size);
+
+        size_t left = this->capacity - right;
+        if (left > 0)
+        {
+            memcpy(new_data + (right * this->element_props.size), this->data, left * this->element_props.size);
+        }
+
+        free(this->data);
+    }
+
+    this->data = new_data;
+    this->capacity = new_capacity;
+    this->head = 0;
+}
+
+void VecDeque_push_back(VecDeque *this, const void *value)
+{
+    if (this->length == this->capacity)
+    {
+        _VecDeque_grow_buffer(this);
+    }
+
+    size_t insert_index = (this->head + this->length) % this->capacity;
+    memcpy(_VecDeque_get(this, insert_index), value, this->element_props.size);
+
+    this->length++;
+}
+
+void VecDeque_push_front(VecDeque *this, const void *value)
+{
+    if (this->length == this->capacity)
+    {
+        _VecDeque_grow_buffer(this);
+    }
+
+    this->head = (this->head + this->capacity - 1) % this->capacity;
+    memcpy(_VecDeque_get(this, this->head), value, this->element_props.size);
+
+    this->length++;
+}
+
+void VecDeque_pop_back(VecDeque *this)
+{
+    if (this->length > 0)
+    {
+        this->element_props.drop(VecDeque_back(this));
+        this->length--;
+    }
+}
+
+void VecDeque_pop_front(VecDeque *this)
+{
+    if (this->length > 0)
+    {
+        this->element_props.drop(VecDeque_front(this));
+        this->head = (this->head + 1) % this->capacity;
+        this->length--;
+    }
+}
+
+void VecDeque_clear(VecDeque *this)
+{
+    while (this->length > 0)
+    {
+        VecDeque_pop_back(this);
+    }
+}
+
+void VecDeque_shrink_to_fit(VecDeque *this)
+{
+    if (this->length == this->capacity)
+    {
+        return;
+    }
+
+    if (this->length == 0)
+    {
+        free(this->data);
+        this->data = NULL;
+        this->capacity = 0;
+    }
+    else
+    {
+        void *new_data = malloc(this->length * this->element_props.size);
+
+        size_t right = MIN(this->length, this->capacity - this->head);
+        memcpy(new_data, VecDeque_front(this), right * this->element_props.size);
+
+        size_t left = this->length - right;
+        if (left > 0)
+        {
+            memcpy((uint8_t *)(new_data) + (right * this->element_props.size), this->data, left * this->element_props.size);
+        }
+
+        free(this->data);
+
+        this->data = new_data;
+        this->capacity = this->length;
+    }
+
+    this->head = 0;
+}
+
+void VecDeque_drop(VecDeque *this)
+{
+    VecDeque_clear(this);
+    free(this->data);
+}
+
 #include <stdint.h>
-#include <assert.h>
 
 int32_t compare_u8(const uint8_t *a, const uint8_t *b)
 {
@@ -999,11 +1164,9 @@ int main(int argc, const char **argv)
 
         for (size_t i = 0; i < Vec_len(&u8vec); i++)
         {
-            uint8_t element = *(uint8_t *)Vec_get(&u8vec, i);
+            uint8_t *element = (uint8_t *)Vec_get_mut(&u8vec, i);
 
-            element = element * 2;
-
-            Vec_set(&u8vec, i, &element);
+            *element = *element * 2;
 
             uint8_t new_element = 0;
 
@@ -1147,6 +1310,56 @@ int main(int argc, const char **argv)
         assert(*((uint8_t *)LinkedList_back(&list)) == 20);
 
         LinkedList_drop(&list);
+    }
+
+    {
+        VecDeque deque;
+        VecDequeElementProps props = {
+            .size = sizeof(uint8_t),
+            .drop = drop_pod,
+        };
+        VecDeque_new(&deque, &props);
+
+        assert(VecDeque_len(&deque) == 0);
+        assert(VecDeque_capacity(&deque) == 0);
+
+        uint8_t value = 10;
+        VecDeque_push_back(&deque, &value);
+        value = 20;
+        VecDeque_push_back(&deque, &value);
+        value = 30;
+        VecDeque_push_back(&deque, &value);
+
+        assert(VecDeque_len(&deque) == 3);
+        assert(VecDeque_capacity(&deque) >= 3);
+
+        uint8_t *front = VecDeque_front(&deque);
+        uint8_t *back = VecDeque_back(&deque);
+        assert(front != NULL && *front == 10);
+        assert(back != NULL && *back == 30);
+
+        value = 5;
+        VecDeque_push_front(&deque, &value);
+        assert(VecDeque_len(&deque) == 4);
+        assert(*(uint8_t *)VecDeque_front(&deque) == 5);
+
+        VecDeque_pop_back(&deque);
+        assert(VecDeque_len(&deque) == 3);
+        assert(*(uint8_t *)VecDeque_back(&deque) == 20);
+
+        VecDeque_pop_front(&deque);
+        assert(VecDeque_len(&deque) == 2);
+        assert(*(uint8_t *)VecDeque_front(&deque) == 10);
+
+        size_t previous_capacity = VecDeque_capacity(&deque);
+        VecDeque_shrink_to_fit(&deque);
+        assert(VecDeque_capacity(&deque) == VecDeque_len(&deque));
+        assert(VecDeque_capacity(&deque) <= previous_capacity);
+
+        VecDeque_clear(&deque);
+        assert(VecDeque_len(&deque) == 0);
+
+        VecDeque_drop(&deque);
     }
 
     return 0;
