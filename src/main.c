@@ -3,11 +3,14 @@
 #include <string.h>
 #include <assert.h>
 
+typedef void (*DropFn)(void *this);
+typedef int_fast8_t (*CmpFn)(const void *a, const void *b);
+
 // [Vec]
 
 typedef struct
 {
-    void (*drop)(void *this);
+    DropFn drop;
 } VecElementOps;
 
 typedef struct
@@ -224,14 +227,14 @@ typedef struct __BTreeMapNode
 typedef struct
 {
     void (*clone)(void *this, const void *src);
-    void (*drop)(void *this);
-    int32_t (*compare)(const void *a, const void *b);
+    DropFn drop;
+    CmpFn cmp;
 } BTreeMapKeyOps;
 
 typedef struct
 {
     void (*clone)(void *this, const void *src);
-    void (*drop)(void *this);
+    DropFn drop;
 } BTreeMapValueOps;
 
 typedef struct
@@ -267,7 +270,7 @@ static void _BTreeMap_drop_key(const BTreeMap *this, void *key)
 
 static int32_t _BTreeMap_compare_key(const BTreeMap *this, const void *a, const void *b)
 {
-    return this->key_ops.compare(a, b);
+    return this->key_ops.cmp(a, b);
 }
 
 static void _BTreeMap_clone_value(const BTreeMap *this, void *dst, const void *src)
@@ -755,7 +758,7 @@ typedef struct _LinkedListNode
 typedef struct
 {
     size_t element_size;
-    void (*drop)(void *this);
+    DropFn drop;
 } LinkedListElementProps;
 
 typedef struct
@@ -939,7 +942,7 @@ void LinkedList_drop(LinkedList *this)
 typedef struct
 {
     size_t size;
-    void (*drop)(void *this);
+    DropFn drop;
 } VecDequeElementProps;
 
 typedef struct
@@ -1129,8 +1132,8 @@ void VecDeque_drop(VecDeque *this)
 typedef struct
 {
     size_t size;
-    void (*drop)(void *this);
-    int32_t (*compare)(const void *a, const void *b);
+    DropFn drop;
+    CmpFn cmp;
 } BinaryHeapElementProps;
 
 typedef struct
@@ -1165,7 +1168,7 @@ static void _BinaryHeap_sift_up(BinaryHeap *this, size_t i)
     {
         size_t parent = PARENT(i);
 
-        if (this->element_props.compare(Vec_get(this->buffer, i), Vec_get(this->buffer, parent)) <= 0)
+        if (this->element_props.cmp(Vec_get(this->buffer, i), Vec_get(this->buffer, parent)) <= 0)
         {
             break;
         }
@@ -1186,12 +1189,12 @@ static void _BinaryHeap_sift_down(BinaryHeap *this, size_t i)
 
         size_t largest = i;
 
-        if (left < length && this->element_props.compare(Vec_get(this->buffer, left), Vec_get(this->buffer, largest)) > 0)
+        if (left < length && this->element_props.cmp(Vec_get(this->buffer, left), Vec_get(this->buffer, largest)) > 0)
         {
             largest = left;
         }
 
-        if (right < length && this->element_props.compare(Vec_get(this->buffer, right), Vec_get(this->buffer, largest)) > 0)
+        if (right < length && this->element_props.cmp(Vec_get(this->buffer, right), Vec_get(this->buffer, largest)) > 0)
         {
             largest = right;
         }
@@ -1350,8 +1353,9 @@ int main(int argc, const char **argv)
 
     {
         BTreeMap u8u8map;
-        BTreeMapKeyOps key_ops = {};
-        key_ops.compare = compare_u8;
+        BTreeMapKeyOps key_ops = {
+            .cmp = (CmpFn)compare_u8,
+        };
         BTreeMapValueOps value_ops = {};
         BTreeMap_new(&u8u8map, sizeof(uint8_t), &key_ops, sizeof(uint8_t), &value_ops);
 
@@ -1504,7 +1508,7 @@ int main(int argc, const char **argv)
         BinaryHeapElementProps props = {
             .size = sizeof(uint8_t),
             .drop = drop_pod,
-            .compare = compare_u8,
+            .cmp = (CmpFn)compare_u8,
         };
 
         BinaryHeap_new(&heap, &props);
