@@ -2,9 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdbool.h>
 
 typedef void (*DropFn)(void *this);
 typedef int_fast8_t (*CmpFn)(const void *a, const void *b);
+typedef bool (*EqFn)(const void *a, const void *b);
 
 // [Vec]
 
@@ -204,8 +206,6 @@ void Vec_drop(Vec *this)
     free(this->data);
     this->data = NULL;
 }
-
-#include <stdbool.h>
 
 // [BTreeMap]
 
@@ -1260,6 +1260,376 @@ void BinaryHeap_drop(BinaryHeap *this)
     free(this->buffer);
 }
 
+// [Hasher]
+
+typedef void (*HasherResetFn)(void *this);
+typedef void (*HasherWriteFn)(void *this, const void *data, size_t length);
+typedef uint64_t (*HasherFinishFn)(const void *this);
+
+typedef struct
+{
+    size_t size;
+    HasherResetFn reset;
+    HasherWriteFn write;
+    HasherFinishFn finish;
+    DropFn drop;
+} HasherProps;
+
+typedef struct
+{
+    void *concrete_hasher;
+    HasherProps props;
+} Hasher;
+
+void Hasher_new(Hasher *this, const HasherProps *props, const void *concrete_hasher)
+{
+    this->props = *props;
+
+    this->concrete_hasher = malloc(this->props.size);
+    memcpy(this->concrete_hasher, concrete_hasher, this->props.size);
+}
+
+void Hasher_reset(Hasher *this)
+{
+    this->props.reset(this->concrete_hasher);
+}
+
+void Hasher_write(Hasher *this, const void *data, size_t length)
+{
+    this->props.write(this->concrete_hasher, data, length);
+}
+
+uint64_t Hasher_finish(const Hasher *this)
+{
+    return this->props.finish(this->concrete_hasher);
+}
+
+void Hasher_drop(Hasher *this)
+{
+    if (this->props.drop != NULL)
+    {
+        this->props.drop(this->concrete_hasher);
+    }
+
+    free(this->concrete_hasher);
+}
+
+// [SimpleHasher]
+
+typedef struct
+{
+    uint64_t state;
+} SimpleHasher;
+
+void SimpleHasher_reset(SimpleHasher *this)
+{
+    this->state = 0;
+}
+
+void SimpleHasher_write(SimpleHasher *this, const void *data, size_t length)
+{
+    const uint8_t *bytes = data;
+
+    for (size_t i = 0; i < length; i++)
+    {
+        this->state += bytes[i];
+    }
+}
+
+uint64_t SimpleHasher_finish(const SimpleHasher *this)
+{
+    return this->state;
+}
+
+// [HashMap]
+
+typedef void (*HashFn)(const void *key, Hasher *hasher);
+
+typedef struct
+{
+    bool is_empty;
+    size_t probe_length;
+} _HashMapEntry;
+
+typedef struct
+{
+    size_t size;
+    EqFn eq;
+    HashFn hash;
+    DropFn drop;
+} HashMapKeyProps;
+
+typedef struct
+{
+    size_t size;
+    DropFn drop;
+} HashMapValueProps;
+
+typedef struct
+{
+    size_t length;
+    size_t capacity;
+    void *entries;
+    HashMapKeyProps key_props;
+    HashMapValueProps value_props;
+    Hasher hasher;
+} HashMap;
+
+void *_HashMapEntry_key(_HashMapEntry *this)
+{
+    return (uint8_t *)(this) + ROUND_SIZE_UP_TO_MAX_ALIGN(sizeof(_HashMapEntry));
+}
+
+void *_HashMapEntry_value(_HashMapEntry *this, const HashMap *map)
+{
+    return (uint8_t *)(_HashMapEntry_key(this)) + ROUND_SIZE_UP_TO_MAX_ALIGN(map->key_props.size);
+}
+
+void _HashMapEntry_new(_HashMapEntry *this, const void *key, const void *value, const HashMap *map)
+{
+    memcpy(_HashMapEntry_key(this), key, map->key_props.size);
+    memcpy(_HashMapEntry_value(this, map), value, map->value_props.size);
+
+    this->is_empty = false;
+    this->probe_length = 0;
+}
+
+size_t _HashMap_entry_size(const HashMap *this)
+{
+    return ROUND_SIZE_UP_TO_MAX_ALIGN(sizeof(_HashMapEntry)) + ROUND_SIZE_UP_TO_MAX_ALIGN(this->key_props.size) + ROUND_SIZE_UP_TO_MAX_ALIGN(this->value_props.size);
+}
+
+_HashMapEntry *_HashMap_entry_at(const HashMap *this, size_t i)
+{
+    return (_HashMapEntry *)((uint8_t *)(this->entries) + (i * _HashMap_entry_size(this)));
+}
+
+void HashMap_with_capacity_and_hasher(HashMap *this, const HashMapKeyProps *key_props, const HashMapValueProps *value_props, size_t capacity, const Hasher *hasher)
+{
+    this->key_props = *key_props;
+    this->value_props = *value_props;
+    this->hasher = *hasher;
+
+    this->length = 0;
+
+    this->capacity = capacity;
+    const size_t entry_size = _HashMap_entry_size(this);
+    this->entries = malloc(this->capacity * entry_size);
+
+    for (size_t i = 0; i < this->capacity; i++)
+    {
+        _HashMap_entry_at(this, i)->is_empty = true;
+    }
+}
+
+void HashMap_insert(HashMap *this, void *key, void *value);
+
+static void _HashMap_grow(HashMap *this)
+{
+    void *old_entries = this->entries;
+    size_t old_length = this->length;
+
+    HashMap_with_capacity_and_hasher(this, &this->key_props, &this->value_props, this->capacity * 2, &this->hasher);
+
+    size_t i = 0;
+
+    while (old_length > 0)
+    {
+        _HashMapEntry *entry = (_HashMapEntry *)((uint8_t *)(old_entries) + (i * _HashMap_entry_size(this)));
+
+        if (!entry->is_empty)
+        {
+            HashMap_insert(this, _HashMapEntry_key(entry), _HashMapEntry_value(entry, this));
+            old_length--;
+        }
+    }
+
+    free(old_entries);
+}
+
+static float _HashMap_load_factor(const HashMap *this)
+{
+    return this->length / (float)(this->capacity);
+}
+
+static void _HashMap_swap(const HashMap *this, _HashMapEntry *a, _HashMapEntry *b)
+{
+    const size_t entry_size = _HashMap_entry_size(this);
+    uint8_t tmp[entry_size];
+
+    memcpy(tmp, a, entry_size);
+    memcpy(a, b, entry_size);
+    memcpy(b, tmp, entry_size);
+}
+
+void HashMap_insert(HashMap *this, void *key, void *value)
+{
+    if (_HashMap_load_factor(this) > 0.7)
+    {
+        _HashMap_grow(this);
+    }
+
+    Hasher_reset(&this->hasher);
+    this->key_props.hash(key, &this->hasher);
+
+    size_t slot = Hasher_finish(&this->hasher) % this->capacity;
+
+    uint8_t entry_buffer[_HashMap_entry_size(this)];
+    _HashMapEntry *entry = (_HashMapEntry *)entry_buffer;
+
+    _HashMapEntry_new(entry, key, value, this);
+
+    while (true)
+    {
+        _HashMapEntry *current_entry = _HashMap_entry_at(this, slot);
+
+        if (current_entry->is_empty)
+        {
+            memcpy(current_entry, entry, _HashMap_entry_size(this));
+            this->length++;
+            break;
+        }
+
+        if (this->key_props.eq(_HashMapEntry_key(entry), _HashMapEntry_key(current_entry)))
+        {
+            this->value_props.drop(_HashMapEntry_value(current_entry, this));
+            memcpy(_HashMapEntry_value(current_entry, this), _HashMapEntry_value(entry, this), ROUND_SIZE_UP_TO_MAX_ALIGN(this->value_props.size));
+            break;
+        }
+
+        if (current_entry->probe_length < entry->probe_length)
+        {
+            _HashMap_swap(this, entry, current_entry);
+        }
+
+        slot = (slot + 1) % this->capacity;
+        entry->probe_length++;
+    }
+}
+
+void HashMap_with_hasher(HashMap *this, const HashMapKeyProps *key_props, const HashMapValueProps *value_props, const Hasher *hasher)
+{
+    const size_t INITIAL_CAPACITY = 16;
+    HashMap_with_capacity_and_hasher(this, key_props, value_props, INITIAL_CAPACITY, hasher);
+}
+
+void HashMap_new(HashMap *this, const HashMapKeyProps *key_props, const HashMapValueProps *value_props)
+{
+    HasherProps props = {
+        .size = sizeof(SimpleHasher),
+        .reset = (HasherResetFn)SimpleHasher_reset,
+        .write = (HasherWriteFn)SimpleHasher_write,
+        .finish = (HasherFinishFn)SimpleHasher_finish,
+    };
+    SimpleHasher hasher = {};
+
+    Hasher _hasher;
+    Hasher_new(&_hasher, &props, &hasher);
+
+    HashMap_with_hasher(this, key_props, value_props, &_hasher);
+}
+
+size_t _HashMap_get_entry(HashMap *this, void *key)
+{
+    size_t result = SIZE_MAX;
+
+    Hasher_reset(&this->hasher);
+    this->key_props.hash(key, &this->hasher);
+
+    size_t slot = Hasher_finish(&this->hasher) % this->capacity;
+    size_t probe_length = 0;
+
+    while (true)
+    {
+        _HashMapEntry *slot_entry = _HashMap_entry_at(this, slot);
+
+        if (slot_entry->is_empty)
+        {
+            break;
+        }
+
+        if (this->key_props.eq(key, _HashMapEntry_key(slot_entry)))
+        {
+            result = slot;
+            break;
+        }
+
+        if (slot_entry->probe_length < probe_length)
+        {
+            break;
+        }
+
+        slot = (slot + 1) % this->capacity;
+        probe_length++;
+    }
+
+    return result;
+}
+
+void *HashMap_get(HashMap *this, void *key)
+{
+    size_t result = _HashMap_get_entry(this, key);
+
+    if (result != SIZE_MAX)
+    {
+        return _HashMapEntry_value(_HashMap_entry_at(this, result), this);
+    }
+    else
+    {
+        return NULL;
+    }
+}
+
+void HashMap_remove(HashMap *this, void *key)
+{
+    size_t slot = _HashMap_get_entry(this, key);
+    if (slot == SIZE_MAX)
+    {
+        return;
+    }
+
+    this->key_props.drop(_HashMapEntry_key(_HashMap_entry_at(this, slot)));
+    this->value_props.drop(_HashMapEntry_value(_HashMap_entry_at(this, slot), this));
+
+    size_t next_slot = (slot + 1) % this->capacity;
+
+    while (true)
+    {
+        _HashMapEntry *entry = _HashMap_entry_at(this, slot);
+        _HashMapEntry *next_entry = _HashMap_entry_at(this, next_slot);
+
+        if (next_entry->is_empty || next_entry->probe_length == 0)
+        {
+            entry->is_empty = true;
+            break;
+        }
+
+        memcpy(entry, next_entry, _HashMap_entry_size(this));
+        entry->probe_length--;
+
+        slot = next_slot;
+        next_slot = (next_slot + 1) % this->capacity;
+    }
+}
+
+void HashMap_drop(HashMap *this)
+{
+    for (size_t i = 0; i < this->capacity; i++)
+    {
+        _HashMapEntry *entry = _HashMap_entry_at(this, i);
+
+        if (!entry->is_empty)
+        {
+            this->key_props.drop(_HashMapEntry_key(entry));
+            this->value_props.drop(_HashMapEntry_value(entry, this));
+        }
+    }
+
+    Hasher_drop(&this->hasher);
+
+    free(this->entries);
+}
+
 #include <stdint.h>
 
 int32_t compare_u8(const uint8_t *a, const uint8_t *b)
@@ -1278,9 +1648,19 @@ int32_t compare_u8(const uint8_t *a, const uint8_t *b)
     }
 }
 
-void drop_pod(void *element)
+bool eq_u8(const void *a, const void *b)
 {
-    (void)element;
+    return *(const uint8_t *)a == *(const uint8_t *)b;
+}
+
+void hash_u8(const void *key, Hasher *hasher)
+{
+    Hasher_write(hasher, key, sizeof(uint8_t));
+}
+
+void drop_nop(void *ptr)
+{
+    (void)ptr;
 }
 
 int main(int argc, const char **argv)
@@ -1406,7 +1786,7 @@ int main(int argc, const char **argv)
     {
         LinkedListElementProps element_props;
         element_props.element_size = sizeof(uint8_t);
-        element_props.drop = drop_pod;
+        element_props.drop = drop_nop;
 
         LinkedList list;
         LinkedList_new(&list, &element_props);
@@ -1457,7 +1837,7 @@ int main(int argc, const char **argv)
         VecDeque deque;
         VecDequeElementProps props = {
             .size = sizeof(uint8_t),
-            .drop = drop_pod,
+            .drop = drop_nop,
         };
         VecDeque_new(&deque, &props);
 
@@ -1507,7 +1887,7 @@ int main(int argc, const char **argv)
         BinaryHeap heap;
         BinaryHeapElementProps props = {
             .size = sizeof(uint8_t),
-            .drop = drop_pod,
+            .drop = drop_nop,
             .cmp = (CmpFn)compare_u8,
         };
 
@@ -1559,6 +1939,60 @@ int main(int argc, const char **argv)
         assert(top != NULL && *top == 42);
 
         BinaryHeap_drop(&heap);
+    }
+
+    {
+        HashMapKeyProps key_props = {
+            .size = sizeof(uint8_t),
+            .eq = eq_u8,
+            .hash = hash_u8,
+            .drop = drop_nop,
+        };
+
+        HashMapValueProps value_props = {
+            .size = sizeof(uint8_t),
+            .drop = drop_nop,
+        };
+
+        HashMap map;
+        HashMap_new(&map, &key_props, &value_props);
+
+        for (uint8_t i = 1; i <= 3; i++)
+        {
+            HashMap_insert(&map, &i, &i);
+        }
+
+        for (uint8_t i = 1; i <= 3; i++)
+        {
+            uint8_t *value = HashMap_get(&map, &i);
+            assert(value != NULL);
+            assert(*value == i);
+        }
+
+        uint8_t key = 2;
+        uint8_t new_value = 42;
+        HashMap_insert(&map, &key, &new_value);
+
+        uint8_t *value = HashMap_get(&map, &key);
+        assert(value != NULL);
+        assert(*value == 42);
+
+        key = 1;
+        HashMap_remove(&map, &key);
+        value = HashMap_get(&map, &key);
+        assert(value == NULL);
+
+        key = 2;
+        HashMap_remove(&map, &key);
+        value = HashMap_get(&map, &key);
+        assert(value == NULL);
+
+        key = 99;
+        HashMap_remove(&map, &key);
+        value = HashMap_get(&map, &key);
+        assert(value == NULL);
+
+        HashMap_drop(&map);
     }
 
     return 0;
