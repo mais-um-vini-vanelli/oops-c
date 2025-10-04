@@ -59,9 +59,14 @@ void Vec_with_capacity(Vec *this, size_t element_size, const VecElementOps *elem
     this->capacity = capacity;
 }
 
-size_t Vec_len(Vec *this)
+size_t Vec_len(const Vec *this)
 {
     return this->length;
+}
+
+void Vec_set_len(Vec *this, size_t len)
+{
+    this->length = len;
 }
 
 size_t Vec_capacity(Vec *this)
@@ -1630,6 +1635,98 @@ void HashMap_drop(HashMap *this)
     free(this->entries);
 }
 
+// [String]
+
+typedef struct
+{
+    Vec *buffer;
+} String;
+
+void String_new(String *this)
+{
+    this->buffer = malloc(sizeof(Vec));
+
+    VecElementOps element_ops = {};
+    Vec_new(this->buffer, sizeof(uint8_t), &element_ops);
+}
+
+void String_insert_str(String *this, size_t i, const char *str)
+{
+    // check if it is on byte boundary
+
+    size_t length = strlen(str);
+
+    if (length == 0)
+    {
+        return;
+    }
+
+    size_t spare_length = Vec_capacity(this->buffer) - Vec_len(this->buffer);
+
+    if (length > spare_length)
+    {
+        size_t additional = length - spare_length;
+        Vec_reserve(this->buffer, additional);
+    }
+
+    if (i != Vec_len(this->buffer))
+    {
+        memmove(Vec_get_mut(this->buffer, i + length), Vec_get(this->buffer, i), Vec_len(this->buffer) - i);
+    }
+
+    memcpy(Vec_get_mut(this->buffer, i), str, length);
+
+    Vec_set_len(this->buffer, Vec_len(this->buffer) + length);
+}
+
+void String_from(String *this, const char *str)
+{
+    String_new(this);
+
+    String_insert_str(this, 0, str);
+}
+
+void String_push_str(String *this, const char *str)
+{
+    String_insert_str(this, Vec_len(this->buffer), str);
+}
+
+void String_reserve(String *this, size_t additional)
+{
+    Vec_reserve(this->buffer, additional);
+}
+
+size_t String_len(const String *this)
+{
+    return Vec_len(this->buffer);
+}
+
+size_t String_capacity(const String *this)
+{
+    return Vec_capacity(this->buffer);
+}
+
+void String_truncate(String *this, size_t len)
+{
+    Vec_truncate(this->buffer, len);
+}
+
+void String_shrink_to_fit(String *this)
+{
+    Vec_shrink_to_fit(this->buffer);
+}
+
+void String_clear(String *this)
+{
+    Vec_clear(this->buffer);
+}
+
+void String_drop(String *this)
+{
+    Vec_drop(this->buffer);
+    free(this->buffer);
+}
+
 #include <stdint.h>
 
 int32_t compare_u8(const uint8_t *a, const uint8_t *b)
@@ -1993,6 +2090,61 @@ int main(int argc, const char **argv)
         assert(value == NULL);
 
         HashMap_drop(&map);
+    }
+
+    {
+        String s1;
+        String_new(&s1);
+
+        assert(String_len(&s1) == 0);
+        assert(String_capacity(&s1) == 0);
+
+        String_drop(&s1);
+
+        String s2;
+        String_from(&s2, "hello");
+
+        assert(String_len(&s2) == 5);
+        assert(memcmp(Vec_get(s2.buffer, 0), "hello", 5) == 0);
+
+        String_drop(&s2);
+
+        String s3;
+        String_new(&s3);
+
+        String_push_str(&s3, "abc");
+        assert(String_len(&s3) == 3);
+        assert(memcmp(Vec_get(s3.buffer, 0), "abc", 3) == 0);
+
+        String_push_str(&s3, "def");
+        assert(String_len(&s3) == 6);
+        assert(memcmp(Vec_get(s3.buffer, 0), "abcdef", 6) == 0);
+
+        String_drop(&s3);
+
+        String s4;
+        String_from(&s4, "HelloWorld");
+
+        String_insert_str(&s4, 5, " ");
+        assert(String_len(&s4) == strlen("Hello World"));
+        assert(memcmp(Vec_get(s4.buffer, 0), "Hello World", 11) == 0);
+
+        String_insert_str(&s4, 0, "C");
+        assert(memcmp(Vec_get(s4.buffer, 0), "CHello World", 12) == 0);
+
+        String_insert_str(&s4, String_len(&s4), "!");
+        assert(memcmp(Vec_get(s4.buffer, 0), "CHello World!", 13) == 0);
+
+        String_drop(&s4);
+
+        String s5;
+        String_new(&s5);
+
+        String_reserve(&s5, 10);
+        assert(String_capacity(&s5) >= 10);
+        assert(String_len(&s5) == 0);
+
+        String_drop(&s5);
     }
 
     return 0;
