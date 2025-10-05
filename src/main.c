@@ -328,7 +328,7 @@ static void _BTreeMapNode_insert_child_at(_BTreeMapNode *this, const BTreeMap *m
 
 static void _BTreeMapNode_remove_child_at(_BTreeMapNode *this, const BTreeMap *map, size_t i)
 {
-    _BTreeMapNode_shift_children(this, map, i, 1);
+    _BTreeMapNode_shift_children(this, map, i, -1);
 }
 
 static void _BTreeMapNode_take_entries(_BTreeMapNode *this, _BTreeMapNode *other, const BTreeMap *map, size_t from_idx)
@@ -343,7 +343,7 @@ static void _BTreeMapNode_take_children(_BTreeMapNode *this, _BTreeMapNode *othe
 {
     const size_t children_to_take = (other->key_count + 1) - from_idx;
 
-    memcpy(_BTreeMapNode_key(this, map, this->key_count), _BTreeMapNode_key(other, map, from_idx), children_to_take * sizeof(this->children[0]));
+    memcpy(&this->children[this->key_count], &other->children[from_idx], children_to_take * sizeof(this->children[0]));
 
     for (size_t i = 0; i < children_to_take; i++)
     {
@@ -479,7 +479,7 @@ static void _BTreeMap_fix_overflow_up(BTreeMap *this, _BTreeMapNode *node)
             _BTreeMapNode_take_children(right, left, this, mid + 1);
         }
 
-        right->key_count = left->key_count - mid + 1;
+        right->key_count = left->key_count - (mid + 1);
 
         void *separator_key = _BTreeMapNode_key(left, this, mid);
         void *separator_value = _BTreeMapNode_value(left, this, mid);
@@ -641,6 +641,22 @@ static void _BTreeMap_fix_underflow_up(BTreeMap *this, _BTreeMapNode *node)
 
     while (current->key_count < BTREEMAP_MINIMUM_KEY_COUNT)
     {
+        bool is_root = current->parent == NULL;
+        if (is_root)
+        {
+            if (!current->is_leaf && current->key_count == 0)
+            {
+                _BTreeMapNode *old_root = this->root;
+
+                this->root = this->root->children[0];
+                this->root->parent = NULL;
+
+                free(old_root);
+            }
+
+            break;
+        }
+
         _BTreeMapNode *parent = current->parent;
         size_t child_idx = _BTreeMapNode_child_idx(parent, current);
 
