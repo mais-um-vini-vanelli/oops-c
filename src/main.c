@@ -3,6 +3,10 @@
 #include <string.h>
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
+
+#define ROUND_SIZE_UP_TO_ALIGN(size, align) (((size + align - 1) / align) * align)
+#define ROUND_SIZE_UP_TO_MAX_ALIGN(size) ROUND_SIZE_UP_TO_ALIGN(size, _Alignof(max_align_t))
 
 typedef void (*DropFn)(void *this);
 typedef int_fast8_t (*CmpFn)(const void *a, const void *b);
@@ -220,84 +224,47 @@ void Vec_drop(Vec *this)
 #define BTREEMAP_MINIMUM_CHILD_COUNT (BTREEMAP_MINIMUM_KEY_COUNT + 1)
 #define BTREEMAP_MAXIMUM_CHILD_COUNT (BTREEMAP_MAXIMUM_KEY_COUNT + 1)
 
+static void _swap(void *a, void *b, size_t size)
+{
+    uint8_t tmp[size];
+
+    memcpy(tmp, a, size);
+    memcpy(a, b, size);
+    memcpy(b, tmp, size);
+}
+
 typedef struct __BTreeMapNode
 {
+    struct __BTreeMapNode *parent;
     bool is_leaf;
-    size_t key_count;
-    void *keys[BTREEMAP_MAXIMUM_KEY_COUNT];
-    void *values[BTREEMAP_MAXIMUM_KEY_COUNT];
     struct __BTreeMapNode *children[BTREEMAP_MAXIMUM_CHILD_COUNT];
+    size_t key_count;
 } _BTreeMapNode;
 
 typedef struct
 {
-    void (*clone)(void *this, const void *src);
-    DropFn drop;
+    size_t size;
     CmpFn cmp;
-} BTreeMapKeyOps;
+    DropFn drop;
+} BTreeMapKeyProps;
 
 typedef struct
 {
-    void (*clone)(void *this, const void *src);
+    size_t size;
     DropFn drop;
-} BTreeMapValueOps;
+} BTreeMapValueProps;
 
 typedef struct
 {
     _BTreeMapNode *root;
-    size_t key_size;
-    BTreeMapKeyOps key_ops;
-    size_t value_size;
-    BTreeMapValueOps value_ops;
+    size_t length;
+    BTreeMapKeyProps key_props;
+    BTreeMapValueProps value_props;
 } BTreeMap;
 
-static void _BTreeMap_clone_key(const BTreeMap *this, void *dst, const void *src)
+static size_t _BTreeMap_node_size(const BTreeMap *this)
 {
-    if (this->key_ops.clone)
-    {
-        this->key_ops.clone(dst, src);
-    }
-    else
-    {
-        // Assume element is POD and make a shallow copy
-        memcpy(dst, src, this->key_size);
-    }
-}
-
-static void _BTreeMap_drop_key(const BTreeMap *this, void *key)
-{
-    if (this->key_ops.drop)
-    {
-        this->key_ops.drop(key);
-    }
-    // If this->key_ops.drop == NULL, assume key is POD and doesn't need to be dropped
-}
-
-static int32_t _BTreeMap_compare_key(const BTreeMap *this, const void *a, const void *b)
-{
-    return this->key_ops.cmp(a, b);
-}
-
-static void _BTreeMap_clone_value(const BTreeMap *this, void *dst, const void *src)
-{
-    if (this->value_ops.clone)
-    {
-        this->value_ops.clone(dst, src);
-    }
-    else
-    {
-        // Assume element is POD and make a shallow copy
-        memcpy(dst, src, this->value_size);
-    }
-}
-
-static void _BTreeMap_drop_value(const BTreeMap *this, void *value)
-{
-    if (this->value_ops.drop)
-    {
-        this->value_ops.drop(value);
-    }
-    // If this->value_ops.drop == NULL, assume value is POD and doesn't need to be dropped
+    return ROUND_SIZE_UP_TO_MAX_ALIGN(sizeof(_BTreeMapNode)) + ROUND_SIZE_UP_TO_MAX_ALIGN(BTREEMAP_MAXIMUM_KEY_COUNT * this->key_props.size) + ROUND_SIZE_UP_TO_MAX_ALIGN(BTREEMAP_MAXIMUM_KEY_COUNT * this->value_props.size);
 }
 
 static void _BTreeMapNode_new(_BTreeMapNode *this, bool is_leaf)
@@ -306,15 +273,112 @@ static void _BTreeMapNode_new(_BTreeMapNode *this, bool is_leaf)
     this->key_count = 0;
 }
 
+static void *_BTreeMapNode_key(_BTreeMapNode *this, const BTreeMap *map, size_t i)
+{
+    uint8_t *keys = (uint8_t *)(this) + ROUND_SIZE_UP_TO_MAX_ALIGN(sizeof(*this));
+    return keys + (i * map->key_props.size);
+}
+
+static void *_BTreeMapNode_value(_BTreeMapNode *this, const BTreeMap *map, size_t i)
+{
+    uint8_t *values = (uint8_t *)(_BTreeMapNode_key(this, map, 0)) + ROUND_SIZE_UP_TO_MAX_ALIGN(BTREEMAP_MAXIMUM_KEY_COUNT * map->key_props.size);
+    return values + (i * map->value_props.size);
+}
+
+static void _BTreeMapNode_shift_entries(_BTreeMapNode *this, const BTreeMap *map, size_t i, int8_t shift_by)
+{
+    const size_t entries_to_shift = this->key_count - i;
+
+    if (entries_to_shift)
+    {
+        memmove(_BTreeMapNode_key(this, map, i + shift_by), _BTreeMapNode_key(this, map, i), entries_to_shift * map->key_props.size);
+        memmove(_BTreeMapNode_value(this, map, i + shift_by), _BTreeMapNode_value(this, map, i), entries_to_shift * map->value_props.size);
+    }
+}
+
+static void _BTreeMapNode_shift_children(_BTreeMapNode *this, const BTreeMap *map, size_t i, int8_t shift_by)
+{
+    const size_t children_to_shift = (this->key_count + 1) - i;
+
+    if (children_to_shift)
+    {
+        memmove(&this->children[i + shift_by], &this->children[i], children_to_shift * sizeof(this->children[0]));
+    }
+}
+
+static void _BTreeMapNode_remove_entry_at(_BTreeMapNode *this, const BTreeMap *map, size_t i)
+{
+    _BTreeMapNode_shift_entries(this, map, i, -1);
+}
+
+static void _BTreeMapNode_insert_entry_at(_BTreeMapNode *this, const BTreeMap *map, size_t i, const void *key, const void *value)
+{
+    _BTreeMapNode_shift_entries(this, map, i, 1);
+
+    memcpy(_BTreeMapNode_key(this, map, i), key, map->key_props.size);
+    memcpy(_BTreeMapNode_value(this, map, i), value, map->value_props.size);
+}
+
+static void _BTreeMapNode_insert_child_at(_BTreeMapNode *this, const BTreeMap *map, size_t i, void *child)
+{
+    _BTreeMapNode_shift_children(this, map, i, 1);
+
+    this->children[i] = child;
+}
+
+static void _BTreeMapNode_remove_child_at(_BTreeMapNode *this, const BTreeMap *map, size_t i)
+{
+    _BTreeMapNode_shift_children(this, map, i, 1);
+}
+
+static void _BTreeMapNode_take_entries(_BTreeMapNode *this, _BTreeMapNode *other, const BTreeMap *map, size_t from_idx)
+{
+    const size_t entries_to_take = other->key_count - from_idx;
+
+    memcpy(_BTreeMapNode_key(this, map, this->key_count), _BTreeMapNode_key(other, map, from_idx), entries_to_take * map->key_props.size);
+    memcpy(_BTreeMapNode_value(this, map, this->key_count), _BTreeMapNode_value(other, map, from_idx), entries_to_take * map->value_props.size);
+}
+
+static void _BTreeMapNode_take_children(_BTreeMapNode *this, _BTreeMapNode *other, const BTreeMap *map, size_t from_idx)
+{
+    const size_t children_to_take = (other->key_count + 1) - from_idx;
+
+    memcpy(_BTreeMapNode_key(this, map, this->key_count), _BTreeMapNode_key(other, map, from_idx), children_to_take * sizeof(this->children[0]));
+
+    for (size_t i = 0; i < children_to_take; i++)
+    {
+        other->children[from_idx + i]->parent = this;
+    }
+}
+
+static size_t _BTreeMapNode_child_idx(const _BTreeMapNode *this, _BTreeMapNode *child)
+{
+    size_t child_idx = SIZE_MAX;
+
+    for (size_t i = 0; i < this->key_count + 1; i++)
+    {
+        if (this->children[i] == child)
+        {
+            child_idx = i;
+        }
+    }
+
+    return child_idx;
+}
+
 static void _BTreeMapNode_drop(_BTreeMapNode *this, const BTreeMap *map)
 {
     for (size_t i = 0; i < this->key_count; i++)
     {
-        _BTreeMap_drop_key(map, this->keys[i]);
-        free(this->keys[i]);
+        if (map->key_props.drop != NULL)
+        {
+            map->key_props.drop(_BTreeMapNode_key(this, map, i));
+        }
 
-        _BTreeMap_drop_value(map, this->values[i]);
-        free(this->values[i]);
+        if (map->value_props.drop != NULL)
+        {
+            map->value_props.drop(_BTreeMapNode_value(this, map, i));
+        }
     }
 
     if (!this->is_leaf)
@@ -327,418 +391,333 @@ static void _BTreeMapNode_drop(_BTreeMapNode *this, const BTreeMap *map)
     }
 }
 
-static void _BTreeMapNode_get(_BTreeMapNode *this, const BTreeMap *map, const void *key, const void **value)
+typedef enum
 {
-    size_t i;
-    for (i = 0; i < this->key_count && _BTreeMap_compare_key(map, key, this->keys[i]) > 0; i++)
-        ;
+    GET_RESULT_KIND_FOUND,
+    GET_RESULT_KIND_GO_DOWN,
+} _GetResultKind;
 
-    if (i < this->key_count && _BTreeMap_compare_key(map, key, this->keys[i]) == 0)
+typedef struct
+{
+    _GetResultKind kind;
+
+    union
     {
-        *value = this->values[i];
-    }
-    else
-    {
-        if (this->is_leaf)
+        struct
         {
-            *value = NULL;
-        }
-        else
+            _BTreeMapNode *node;
+            size_t key_idx;
+        } found;
+
+        struct
         {
-            _BTreeMapNode_get(this->children[i], map, key, value);
-        }
-    }
-}
+            _BTreeMapNode *node;
+            size_t child_idx;
+        } go_down;
+    };
+} _GetResult;
 
-static void _BTreeMapNode_split_child(_BTreeMapNode *this, size_t child_idx)
+static void _BTreeMap_get(BTreeMap *this, const void *key, _GetResult *result)
 {
-    _BTreeMapNode *full_child = this->children[child_idx];
+    _BTreeMapNode *current = this->root;
 
-    _BTreeMapNode *new_child = malloc(sizeof(_BTreeMapNode));
-    _BTreeMapNode_new(new_child, full_child->is_leaf);
-
-    // Move keys, values and children to new child
-
-    new_child->key_count = BTREEMAP_MINIMUM_KEY_COUNT;
-
-    memmove(new_child->keys, full_child->keys + BTREEMAP_T, sizeof(new_child->keys[0]) * BTREEMAP_MINIMUM_KEY_COUNT);
-    memmove(new_child->values, full_child->values + BTREEMAP_T, sizeof(new_child->values[0]) * BTREEMAP_MINIMUM_KEY_COUNT);
-
-    if (!full_child->is_leaf)
-    {
-        memmove(new_child->children, full_child->children + BTREEMAP_T, sizeof(new_child->children[0]) * BTREEMAP_MINIMUM_CHILD_COUNT);
-    }
-
-    full_child->key_count = BTREEMAP_T;
-
-    // Shift parent's keys/values and insert median
-
-    void *median_key = full_child->keys[BTREEMAP_T - 1];
-    void *median_value = full_child->values[BTREEMAP_T - 1];
-
-    full_child->key_count--;
-
-    const size_t elements_to_move = this->key_count - child_idx;
-
-    this->key_count++;
-
-    memmove(this->keys + child_idx + 1, this->keys + child_idx, elements_to_move * sizeof(this->keys[0]));
-    memmove(this->values + child_idx + 1, this->values + child_idx, elements_to_move * sizeof(this->values[0]));
-
-    this->keys[child_idx] = median_key;
-    this->values[child_idx] = median_value;
-
-    memmove(this->children + child_idx + 2, this->children + child_idx + 1, elements_to_move * sizeof(this->children[0]));
-
-    this->children[child_idx + 1] = new_child;
-}
-
-static void _BTreeMapNode_insert(_BTreeMapNode *this, BTreeMap *map, const void *key, const void *value)
-{
-    if (this->is_leaf)
+    while (true)
     {
         size_t i;
-        for (i = 0; i < this->key_count && _BTreeMap_compare_key(map, key, this->keys[i]) > 0; i++)
+        for (i = 0; i < current->key_count && this->key_props.cmp(key, _BTreeMapNode_key(current, this, i)) > 0; i++)
             ;
 
-        if (i < this->key_count && _BTreeMap_compare_key(map, key, this->keys[i]) == 0)
+        if (i < current->key_count && this->key_props.cmp(key, _BTreeMapNode_key(current, this, i)) == 0)
         {
-            _BTreeMap_drop_value(map, this->values[i]);
-            _BTreeMap_clone_value(map, this->values[i], value);
-            return;
+            result->kind = GET_RESULT_KIND_FOUND;
+            result->found.node = current;
+            result->found.key_idx = i;
+            break;
         }
 
-        const size_t elements_to_move = this->key_count - i;
-
-        this->key_count++;
-
-        memmove(this->keys + i + 1, this->keys + i, elements_to_move * sizeof(this->keys[0]));
-        memmove(this->values + i + 1, this->values + i, elements_to_move * sizeof(this->values[0]));
-
-        this->keys[i] = malloc(map->key_size);
-        _BTreeMap_clone_key(map, this->keys[i], key);
-        this->values[i] = malloc(map->value_size);
-        _BTreeMap_clone_value(map, this->values[i], value);
-    }
-    else
-    {
-        size_t i;
-        for (i = 0; i < this->key_count && _BTreeMap_compare_key(map, key, this->keys[i]) > 0; i++)
-            ;
-
-        if (i < this->key_count && _BTreeMap_compare_key(map, key, this->keys[i]) == 0)
+        if (current->is_leaf)
         {
-            _BTreeMap_drop_value(map, this->values[i]);
-            _BTreeMap_clone_value(map, this->values[i], value);
-            return;
+            result->kind = GET_RESULT_KIND_GO_DOWN;
+            result->go_down.node = current;
+            result->go_down.child_idx = i;
+            break;
         }
 
-        if (this->children[i]->key_count == BTREEMAP_MAXIMUM_KEY_COUNT)
+        current = current->children[i];
+    }
+}
+
+const void *BTreeMap_get(BTreeMap *this, const void *key)
+{
+    _GetResult result;
+    _BTreeMap_get(this, key, &result);
+
+    if (result.kind != GET_RESULT_KIND_FOUND)
+    {
+        return NULL;
+    }
+
+    return _BTreeMapNode_value(result.found.node, this, result.found.key_idx);
+}
+
+static void _BTreeMap_fix_overflow_up(BTreeMap *this, _BTreeMapNode *node)
+{
+    _BTreeMapNode *current = node;
+
+    while (current->key_count == BTREEMAP_MAXIMUM_KEY_COUNT)
+    {
+        _BTreeMapNode *left = current;
+
+        _BTreeMapNode *right = malloc(_BTreeMap_node_size(this));
+        _BTreeMapNode_new(right, left->is_leaf);
+
+        size_t mid = left->key_count / 2;
+        _BTreeMapNode_take_entries(right, left, this, mid + 1);
+
+        if (!left->is_leaf)
         {
-            _BTreeMapNode_split_child(this, i);
-
-            // Compare with the median brought up from the child
-            int32_t result = _BTreeMap_compare_key(map, key, this->keys[i]);
-            if (result == 0)
-            {
-                _BTreeMap_drop_value(map, this->values[i]);
-                _BTreeMap_clone_value(map, this->values[i], value);
-                return;
-            }
-
-            i = result > 0 ? i + 1 : i;
+            _BTreeMapNode_take_children(right, left, this, mid + 1);
         }
 
-        _BTreeMapNode_insert(this->children[i], map, key, value);
-    }
-}
+        right->key_count = left->key_count - mid + 1;
 
-static void _BTreeMapNode_borrow_from_right(_BTreeMapNode *this, size_t child_idx)
-{
-    _BTreeMapNode *child = this->children[child_idx];
-    _BTreeMapNode *sibling = this->children[child_idx + 1];
+        void *separator_key = _BTreeMapNode_key(left, this, mid);
+        void *separator_value = _BTreeMapNode_value(left, this, mid);
+        _BTreeMapNode_remove_entry_at(left, this, mid);
 
-    child->keys[child->key_count] = this->keys[child_idx];
-    child->values[child->key_count] = this->values[child_idx];
+        left->key_count = mid;
 
-    if (!child->is_leaf)
-    {
-        child->children[child->key_count + 1] = sibling->children[0];
-    }
-
-    child->key_count++;
-
-    this->keys[child_idx] = sibling->keys[0];
-    this->values[child_idx] = sibling->values[0];
-
-    const size_t elements_to_move = sibling->key_count - 1;
-    memmove(sibling->keys, sibling->keys + 1, sizeof(sibling->keys[0]) * elements_to_move);
-    memmove(sibling->values, sibling->values + 1, sizeof(sibling->values[0]) * elements_to_move);
-
-    if (!sibling->is_leaf)
-    {
-        memmove(sibling->children, sibling->children + 1, sizeof(sibling->children[0]) * elements_to_move + 1);
-    }
-
-    sibling->key_count--;
-}
-
-static void _BTreeMapNode_borrow_from_left(_BTreeMapNode *this, size_t child_idx)
-{
-    _BTreeMapNode *child = this->children[child_idx];
-    _BTreeMapNode *sibling = this->children[child_idx - 1];
-
-    const size_t elements_to_move = child->key_count;
-    memmove(child->keys + 1, child->keys, sizeof(child->keys[0]) * elements_to_move);
-    memmove(child->values + 1, child->values, sizeof(child->values[0]) * elements_to_move);
-
-    if (!child->is_leaf)
-    {
-        memmove(child->children + 1, child->children, sizeof(child->children[0]) * elements_to_move + 1);
-    }
-
-    child->keys[0] = this->keys[child_idx - 1];
-    child->values[0] = this->values[child_idx - 1];
-
-    if (!child->is_leaf)
-    {
-        child->children[0] = sibling->children[sibling->key_count];
-    }
-
-    child->key_count++;
-
-    this->keys[child_idx - 1] = sibling->keys[sibling->key_count - 1];
-    this->values[child_idx - 1] = sibling->values[sibling->key_count - 1];
-
-    sibling->key_count--;
-}
-
-static void _BTreeMapNode_merge_with_right(_BTreeMapNode *this, size_t child_idx)
-{
-    _BTreeMapNode *child = this->children[child_idx];
-    _BTreeMapNode *sibling = this->children[child_idx + 1];
-
-    child->keys[child->key_count] = this->keys[child_idx];
-    child->values[child->key_count] = this->values[child_idx];
-
-    size_t elements_to_move = sibling->key_count;
-    memmove(child->keys + BTREEMAP_MINIMUM_KEY_COUNT + 1, sibling->keys, elements_to_move * sizeof(sibling->keys[0]));
-    memmove(child->values + BTREEMAP_MINIMUM_KEY_COUNT + 1, sibling->values, elements_to_move * sizeof(sibling->values[0]));
-
-    if (!child->is_leaf)
-    {
-        memmove(child->children + BTREEMAP_MINIMUM_KEY_COUNT + 1, sibling->children, (elements_to_move + 1) * sizeof(sibling->values[0]));
-    }
-
-    child->key_count += sibling->key_count + 1;
-
-    free(sibling);
-
-    elements_to_move = this->key_count - child_idx - 1;
-    memmove(this->keys + child_idx, this->keys + child_idx + 1, elements_to_move * sizeof(this->keys[0]));
-    memmove(this->values + child_idx, this->values + child_idx + 1, elements_to_move * sizeof(this->values[0]));
-
-    memmove(this->children + child_idx + 1, this->children + child_idx + 2, (elements_to_move + 1) * sizeof(this->children[0]));
-
-    this->key_count--;
-}
-
-static void _BTreeMapNode_fill_child(_BTreeMapNode *this, size_t *child_idx)
-{
-    bool is_leftmost = *child_idx == 0;
-    bool is_rightmost = *child_idx == this->key_count;
-
-    if (is_leftmost)
-    {
-        if (this->children[*child_idx + 1]->key_count > BTREEMAP_MINIMUM_KEY_COUNT)
+        if (current->parent == NULL)
         {
-            _BTreeMapNode_borrow_from_right(this, *child_idx);
+            _BTreeMapNode *new_root = malloc(_BTreeMap_node_size(this));
+            _BTreeMapNode_new(new_root, false);
+
+            _BTreeMapNode_insert_entry_at(new_root, this, 0, separator_key, separator_value);
+
+            new_root->children[0] = left;
+            left->parent = new_root;
+
+            new_root->children[1] = right;
+            right->parent = new_root;
+
+            this->root = new_root;
+            break;
         }
         else
         {
-            _BTreeMapNode_merge_with_right(this, *child_idx);
+            _BTreeMapNode *parent = left->parent;
+            size_t child_idx = _BTreeMapNode_child_idx(parent, left);
+
+            _BTreeMapNode_insert_entry_at(parent, this, child_idx, separator_key, separator_value);
+
+            parent->children[child_idx + 1] = right;
+            right->parent = parent;
+
+            current = parent;
         }
     }
-    else if (is_rightmost)
-    {
-        if (this->children[*child_idx - 1]->key_count > BTREEMAP_MINIMUM_KEY_COUNT)
-        {
-            _BTreeMapNode_borrow_from_left(this, *child_idx);
-        }
-        else
-        {
-            _BTreeMapNode_merge_with_right(this, *child_idx - 1);
-
-            *child_idx = *child_idx - 1;
-        }
-    }
-    else
-    {
-        if (this->children[*child_idx + 1]->key_count > BTREEMAP_MINIMUM_KEY_COUNT)
-        {
-            _BTreeMapNode_borrow_from_right(this, *child_idx);
-        }
-        else if (this->children[*child_idx - 1]->key_count > BTREEMAP_MINIMUM_KEY_COUNT)
-        {
-            _BTreeMapNode_borrow_from_left(this, *child_idx);
-        }
-        else
-        {
-            _BTreeMapNode_merge_with_right(this, *child_idx);
-        }
-    }
-}
-
-static void _BTreeMapNode_get_predecessor(_BTreeMapNode *this, size_t child_idx, void **key, void **value)
-{
-    _BTreeMapNode *current = this->children[child_idx];
-
-    while (!current->is_leaf)
-    {
-        current = current->children[current->key_count];
-    }
-
-    *key = current->keys[current->key_count - 1];
-    *value = current->values[current->key_count - 1];
-}
-
-static void _BTreeMapNode_get_successor(_BTreeMapNode *this, size_t child_idx, void **key, void **value)
-{
-    _BTreeMapNode *current = this->children[child_idx];
-
-    while (!current->is_leaf)
-    {
-        current = current->children[0];
-    }
-
-    *key = current->keys[0];
-    *value = current->values[0];
-}
-
-static void _BTreeMapNode_remove(_BTreeMapNode *this, const BTreeMap *map, const void *key)
-{
-    size_t i;
-    for (i = 0; i < this->key_count && _BTreeMap_compare_key(map, key, this->keys[i]) > 0; i++)
-        ;
-
-    if (i < this->key_count && _BTreeMap_compare_key(map, key, this->keys[i]) == 0)
-    {
-        if (this->is_leaf)
-        {
-            // Key found in leaf
-
-            _BTreeMap_drop_key(map, this->keys[i]);
-            free(this->keys[i]);
-
-            _BTreeMap_drop_value(map, this->values[i]);
-            free(this->values[i]);
-
-            const size_t elements_to_move = this->key_count - i - 1;
-            memmove(this->keys + i, this->keys + i + 1, elements_to_move * sizeof(this->keys[0]));
-            memmove(this->values + i, this->values + i + 1, elements_to_move * sizeof(this->values[0]));
-
-            this->key_count--;
-        }
-        else
-        {
-            // Key found in internal node
-
-            if (this->children[i]->key_count > BTREEMAP_MINIMUM_KEY_COUNT)
-            {
-                void *predecessor_key;
-                void *predecessor_value;
-                _BTreeMapNode_get_predecessor(this, i, &predecessor_key, &predecessor_value);
-
-                _BTreeMap_drop_key(map, this->keys[i]);
-                _BTreeMap_clone_key(map, this->keys[i], predecessor_key);
-
-                _BTreeMap_drop_value(map, this->values[i]);
-                _BTreeMap_clone_value(map, this->values[i], predecessor_value);
-
-                _BTreeMapNode_remove(this->children[i], map, predecessor_key);
-            }
-            else if (this->children[i + 1]->key_count > BTREEMAP_MINIMUM_KEY_COUNT)
-            {
-                void *successor_key;
-                void *successor_value;
-                _BTreeMapNode_get_successor(this, i + 1, &successor_key, &successor_value);
-
-                _BTreeMap_drop_key(map, this->keys[i]);
-                _BTreeMap_clone_key(map, this->keys[i], successor_key);
-
-                _BTreeMap_drop_value(map, this->values[i]);
-                _BTreeMap_clone_value(map, this->values[i], successor_value);
-
-                _BTreeMapNode_remove(this->children[i + 1], map, successor_key);
-            }
-            else
-            {
-                _BTreeMapNode_merge_with_right(this, i);
-                _BTreeMapNode_remove(this->children[i], map, key);
-            }
-        }
-    }
-    else
-    {
-        if (this->is_leaf)
-        {
-            return;
-        }
-
-        if (this->children[i]->key_count == BTREEMAP_MINIMUM_KEY_COUNT)
-        {
-            _BTreeMapNode_fill_child(this, &i);
-        }
-
-        _BTreeMapNode_remove(this->children[i], map, key);
-    }
-}
-
-void BTreeMap_new(BTreeMap *this, size_t key_size, BTreeMapKeyOps *key_ops, size_t value_size, const BTreeMapValueOps *value_ops)
-{
-    this->key_size = key_size;
-    this->key_ops = *key_ops;
-    this->value_size = value_size;
-    this->value_ops = *value_ops;
-
-    this->root = malloc(sizeof(_BTreeMapNode));
-    _BTreeMapNode_new(this->root, true);
-}
-
-void BTreeMap_get(BTreeMap *this, const void *key, const void **value)
-{
-    _BTreeMapNode_get(this->root, this, key, value);
 }
 
 void BTreeMap_insert(BTreeMap *this, const void *key, const void *value)
 {
-    if (this->root->key_count == BTREEMAP_MAXIMUM_KEY_COUNT)
+    _GetResult result;
+    _BTreeMap_get(this, key, &result);
+
+    if (result.kind == GET_RESULT_KIND_FOUND)
     {
-        _BTreeMapNode *new_root = malloc(sizeof(_BTreeMapNode));
-        _BTreeMapNode_new(new_root, false);
+        _BTreeMapNode *node = result.found.node;
+        size_t idx = result.found.key_idx;
 
-        new_root->children[0] = this->root;
-        _BTreeMapNode_split_child(new_root, 0);
+        if (this->value_props.drop != NULL)
+        {
+            this->value_props.drop(_BTreeMapNode_value(node, this, idx));
+        }
 
-        this->root = new_root;
+        memcpy(_BTreeMapNode_value(node, this, idx), value, this->value_props.size);
+    }
+    else
+    {
+        _BTreeMapNode *node = result.go_down.node;
+        size_t idx = result.go_down.child_idx;
+
+        _BTreeMapNode_insert_entry_at(node, this, idx, key, value);
+        node->key_count++;
+
+        _BTreeMap_fix_overflow_up(this, node);
+    }
+}
+
+static void _BTreeMapNode_borrow_from_left(_BTreeMapNode *parent, size_t child_idx, const BTreeMap *map)
+{
+    _BTreeMapNode *node = parent->children[child_idx];
+    _BTreeMapNode *left = parent->children[child_idx - 1];
+
+    // Insert separator at the front
+    size_t separator_idx = child_idx - 1;
+    void *separator_key = _BTreeMapNode_key(parent, map, separator_idx);
+    void *separator_value = _BTreeMapNode_value(parent, map, separator_idx);
+    _BTreeMapNode_insert_entry_at(node, map, 0, separator_key, separator_value);
+
+    // Move last entry of left to separator slot
+    void *last_key = _BTreeMapNode_key(left, map, left->key_count - 1);
+    void *last_value = _BTreeMapNode_value(left, map, left->key_count - 1);
+    _BTreeMapNode_remove_entry_at(left, map, left->key_count - 1);
+
+    memmove(_BTreeMapNode_key(parent, map, separator_idx), last_key, map->key_props.size);
+    memmove(_BTreeMapNode_value(parent, map, separator_idx), last_value, map->value_props.size);
+
+    if (!node->is_leaf)
+    {
+        void *last_child = left->children[left->key_count];
+        _BTreeMapNode_remove_child_at(left, map, left->key_count);
+
+        _BTreeMapNode_insert_child_at(node, map, 0, last_child);
     }
 
-    _BTreeMapNode_insert(this->root, this, key, value);
+    left->key_count--;
+    node->key_count++;
+}
+
+static void _BTreeMapNode_borrow_from_right(_BTreeMapNode *parent, size_t child_idx, const BTreeMap *map)
+{
+    _BTreeMapNode *node = parent->children[child_idx];
+    _BTreeMapNode *right = parent->children[child_idx + 1];
+
+    // Insert separator at the back
+    size_t separator_idx = child_idx;
+    void *separator_key = _BTreeMapNode_key(parent, map, separator_idx);
+    void *separator_value = _BTreeMapNode_value(parent, map, separator_idx);
+    _BTreeMapNode_insert_entry_at(node, map, node->key_count, separator_key, separator_value);
+
+    // Move first entry of right to separator slot
+    void *last_key = _BTreeMapNode_key(right, map, 0);
+    void *last_value = _BTreeMapNode_value(right, map, 0);
+    _BTreeMapNode_remove_entry_at(right, map, 0);
+
+    memmove(_BTreeMapNode_key(parent, map, separator_idx), last_key, map->key_props.size);
+    memmove(_BTreeMapNode_value(parent, map, separator_idx), last_value, map->value_props.size);
+
+    if (!node->is_leaf)
+    {
+        void *first_child = right->children[0];
+        _BTreeMapNode_remove_child_at(right, map, 0);
+
+        _BTreeMapNode_insert_child_at(node, map, node->key_count, first_child);
+    }
+
+    right->key_count--;
+    node->key_count++;
+}
+
+static void _BTreeMapNode_merge_with_right(_BTreeMapNode *parent, size_t child_idx, const BTreeMap *map)
+{
+    _BTreeMapNode *node = parent->children[child_idx];
+    _BTreeMapNode *right = parent->children[child_idx + 1];
+
+    // Insert separator at the back
+    size_t separator_idx = child_idx;
+    void *separator_key = _BTreeMapNode_key(parent, map, separator_idx);
+    void *separator_value = _BTreeMapNode_value(parent, map, separator_idx);
+    _BTreeMapNode_insert_entry_at(node, map, node->key_count, separator_key, separator_value);
+    node->key_count++;
+
+    // Take all entries from sibling
+    _BTreeMapNode_take_entries(node, right, map, 0);
+
+    if (!node->is_leaf)
+    {
+        _BTreeMapNode_take_children(node, right, map, 0);
+    }
+
+    free(right);
+
+    _BTreeMapNode_remove_entry_at(parent, map, separator_idx);
+    _BTreeMapNode_remove_child_at(parent, map, separator_idx + 1);
+}
+
+static void _BTreeMap_fix_underflow_up(BTreeMap *this, _BTreeMapNode *node)
+{
+    _BTreeMapNode *current = node;
+
+    while (current->key_count < BTREEMAP_MINIMUM_KEY_COUNT)
+    {
+        _BTreeMapNode *parent = current->parent;
+        size_t child_idx = _BTreeMapNode_child_idx(parent, current);
+
+        bool has_left_sibling = child_idx > 0;
+        bool has_right_sibling = child_idx < parent->key_count + 1;
+
+        if (has_left_sibling && parent->children[child_idx - 1]->key_count > BTREEMAP_MINIMUM_KEY_COUNT)
+        {
+            _BTreeMapNode_borrow_from_left(parent, child_idx, this);
+            break;
+        }
+        else if (has_right_sibling && parent->children[child_idx + 1]->key_count > BTREEMAP_MINIMUM_KEY_COUNT)
+        {
+            _BTreeMapNode_borrow_from_right(parent, child_idx, this);
+            break;
+        }
+        else
+        {
+            _BTreeMapNode_merge_with_right(parent, has_right_sibling ? child_idx : child_idx - 1, this);
+
+            current = parent;
+        }
+    }
 }
 
 void BTreeMap_remove(BTreeMap *this, const void *key)
 {
-    _BTreeMapNode_remove(this->root, this, key);
+    _GetResult result;
+    _BTreeMap_get(this, key, &result);
 
-    if (this->root->key_count == 0)
+    if (result.kind != GET_RESULT_KIND_FOUND)
     {
-        if (!this->root->is_leaf)
-        {
-            _BTreeMapNode *old_root = this->root;
-            this->root = old_root->children[0];
-            free(old_root);
-        }
+        return;
     }
+
+    _BTreeMapNode *node = result.found.node;
+    size_t idx = result.found.key_idx;
+
+    if (!node->is_leaf)
+    {
+        _BTreeMapNode *predecessor = node->children[idx];
+
+        while (!predecessor->is_leaf)
+        {
+            predecessor = predecessor->children[predecessor->key_count];
+        }
+
+        _swap(_BTreeMapNode_key(node, this, idx), _BTreeMapNode_key(predecessor, this, predecessor->key_count - 1), this->key_props.size);
+        _swap(_BTreeMapNode_value(node, this, idx), _BTreeMapNode_value(predecessor, this, predecessor->key_count - 1), this->value_props.size);
+
+        node = predecessor;
+        idx = predecessor->key_count - 1;
+    }
+
+    if (this->key_props.drop != NULL)
+    {
+        this->key_props.drop(_BTreeMapNode_key(node, this, idx));
+    }
+
+    if (this->value_props.drop != NULL)
+    {
+        this->value_props.drop(_BTreeMapNode_value(node, this, idx));
+    }
+
+    _BTreeMapNode_remove_entry_at(node, this, idx);
+
+    _BTreeMap_fix_underflow_up(this, node);
+}
+
+void BTreeMap_new(BTreeMap *this, const BTreeMapKeyProps *key_props, const BTreeMapValueProps *value_props)
+{
+    this->key_props = *key_props;
+    this->value_props = *value_props;
+
+    this->length = 0;
+    this->root = malloc(_BTreeMap_node_size(this));
+    _BTreeMapNode_new(this->root, true);
 }
 
 void BTreeMap_drop(BTreeMap *this)
@@ -750,9 +729,6 @@ void BTreeMap_drop(BTreeMap *this)
 // [LinkedList]
 
 #include <stddef.h>
-
-#define ROUND_SIZE_UP_TO_ALIGN(size, align) (((size + align - 1) / align) * align)
-#define ROUND_SIZE_UP_TO_MAX_ALIGN(size) ROUND_SIZE_UP_TO_ALIGN(size, _Alignof(max_align_t))
 
 typedef struct _LinkedListNode
 {
@@ -1830,11 +1806,14 @@ int main(int argc, const char **argv)
 
     {
         BTreeMap u8u8map;
-        BTreeMapKeyOps key_ops = {
+        BTreeMapKeyProps key_props = {
+            .size = sizeof(uint8_t),
             .cmp = (CmpFn)compare_u8,
         };
-        BTreeMapValueOps value_ops = {};
-        BTreeMap_new(&u8u8map, sizeof(uint8_t), &key_ops, sizeof(uint8_t), &value_ops);
+        BTreeMapValueProps value_props = {
+            .size = sizeof(uint8_t),
+        };
+        BTreeMap_new(&u8u8map, &key_props, &value_props);
 
         for (uint8_t i = 1; i <= 3; i++)
         {
@@ -1843,8 +1822,7 @@ int main(int argc, const char **argv)
 
         for (uint8_t i = 1; i <= 3; i++)
         {
-            const void *value = NULL;
-            BTreeMap_get(&u8u8map, &i, &value);
+            const void *value = BTreeMap_get(&u8u8map, &i);
 
             assert(value != NULL);
             assert(*(uint8_t *)value == i);
@@ -1853,8 +1831,7 @@ int main(int argc, const char **argv)
         uint8_t key = 2, new_value = 42;
         BTreeMap_insert(&u8u8map, &key, &new_value);
 
-        const void *value = NULL;
-        BTreeMap_get(&u8u8map, &key, &value);
+        const void *value = BTreeMap_get(&u8u8map, &key);
 
         assert(value != NULL);
         assert(*(uint8_t *)value == 42);
@@ -1862,19 +1839,19 @@ int main(int argc, const char **argv)
         // Remove key = 1 (leaf case)
         key = 1;
         BTreeMap_remove(&u8u8map, &key);
-        BTreeMap_get(&u8u8map, &key, &value);
+        value = BTreeMap_get(&u8u8map, &key);
         assert(value == NULL);
 
         // Remove key = 2 (internal node candidate)
         key = 2;
         BTreeMap_remove(&u8u8map, &key);
-        BTreeMap_get(&u8u8map, &key, &value);
+        value = BTreeMap_get(&u8u8map, &key);
         assert(value == NULL);
 
         // Try removing a non-existent key
         key = 99;
         BTreeMap_remove(&u8u8map, &key);
-        BTreeMap_get(&u8u8map, &key, &value);
+        value = BTreeMap_get(&u8u8map, &key);
         assert(value == NULL);
 
         BTreeMap_drop(&u8u8map);
