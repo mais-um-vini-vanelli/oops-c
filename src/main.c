@@ -1627,6 +1627,328 @@ void HashMap_drop(HashMap *this)
     free(this->entries);
 }
 
+// [Str]
+
+typedef struct
+{
+    uint8_t *ptr;
+    size_t len;
+} Str;
+
+Str Str_from_cstr(const char *cstr)
+{
+    Str result = {
+        .ptr = (uint8_t *)cstr,
+        .len = strlen(cstr),
+    };
+    return result;
+}
+
+// [StrSearcher]
+
+typedef enum
+{
+    SEARCH_STEP_MATCH,
+    SEARCH_STEP_REJECT,
+    SEARCH_STEP_DONE,
+} SearchStepKind;
+
+typedef struct
+{
+    SearchStepKind kind;
+
+    union
+    {
+        struct
+        {
+            size_t start;
+            size_t end;
+        } match;
+
+        struct
+        {
+            size_t start;
+            size_t end;
+        } reject;
+    };
+} SearchStep;
+
+typedef struct
+{
+    Str haystack;
+    Str needle;
+    size_t position;
+} StrSearcher;
+
+static void StrSearcher_new(StrSearcher *this, Str haystack, Str needle)
+{
+    this->haystack = haystack;
+    this->needle = needle;
+
+    this->position = 0;
+}
+
+static Str StrSearcher_haystack(const StrSearcher *this)
+{
+    Str result = {
+        .ptr = this->haystack.ptr,
+        .len = this->haystack.len,
+    };
+    return result;
+}
+
+static const uint8_t *_StrSearcher_find_str(const uint8_t *haystack, size_t haystack_len, const uint8_t *needle, size_t needle_len)
+{
+    if (needle_len == 0)
+        return haystack;
+
+    if (needle_len > haystack_len)
+        return NULL;
+
+    const uint8_t *end = haystack + (haystack_len - needle_len) + 1;
+
+    for (const uint8_t *h = haystack; h < end; h++)
+    {
+        if (memcmp(h, needle, needle_len) == 0)
+            return h;
+    }
+
+    return NULL;
+}
+
+static SearchStep StrSearcher_next(StrSearcher *this)
+{
+    SearchStep result;
+
+    if (this->position == this->haystack.len)
+    {
+        result.kind = SEARCH_STEP_DONE;
+        return result;
+    }
+
+    const uint8_t *match = _StrSearcher_find_str(this->haystack.ptr + this->position, this->haystack.len - this->position, this->needle.ptr, this->needle.len);
+
+    if (match == NULL)
+    {
+        result.kind = SEARCH_STEP_REJECT;
+        result.reject.start = this->position;
+        result.reject.end = this->haystack.len;
+
+        this->position = this->haystack.len;
+
+        return result;
+    }
+
+    size_t match_start = match - this->haystack.ptr;
+    size_t match_end = match_start + this->needle.len;
+
+    if (match_start > this->position)
+    {
+        // There's a rejection region before the match
+
+        result.kind = SEARCH_STEP_REJECT;
+        result.reject.start = this->position;
+        result.reject.end = match_start;
+
+        this->position = match_start;
+
+        return result;
+    }
+    else
+    {
+        result.kind = SEARCH_STEP_MATCH;
+        result.match.start = this->position;
+        result.match.end = match_end;
+
+        this->position = match_end;
+
+        return result;
+    }
+}
+
+static void StrSearcher_drop(StrSearcher *this)
+{
+}
+
+// [Iterator]
+
+typedef void *(*IteratorNextFn)(void *this);
+
+typedef struct
+{
+    size_t size;
+    IteratorNextFn next;
+    DropFn drop;
+} IteratorProps;
+
+typedef struct
+{
+    void *concrete;
+    IteratorProps props;
+} Iterator;
+
+void Iterator_new(Iterator *this, const IteratorProps *props, void *concrete)
+{
+    this->props = *props;
+
+    this->concrete = malloc(this->props.size);
+    memcpy(this->concrete, concrete, this->props.size);
+}
+
+void *Iterator_next(Iterator *this)
+{
+    return this->props.next(this->concrete);
+}
+
+void Iterator_drop(Iterator *this)
+{
+    if (this->props.drop != NULL)
+    {
+        this->props.drop(this->concrete);
+    }
+
+    free(this->concrete);
+}
+
+// [MatchesIterator]
+
+typedef struct
+{
+    size_t start;
+    size_t end;
+} Match;
+
+typedef struct
+{
+    StrSearcher searcher;
+    bool is_done;
+    Match current;
+} MatchesIterator;
+
+void MatchesIterator_new(MatchesIterator *this, const StrSearcher *searcher)
+{
+    memcpy(&this->searcher, searcher, sizeof(StrSearcher));
+    this->is_done = false;
+}
+
+void *MatchesIterator_next(MatchesIterator *this)
+{
+    if (this->is_done)
+    {
+        return NULL;
+    }
+
+    while (true)
+    {
+        SearchStep step = StrSearcher_next(&this->searcher);
+
+        if (step.kind == SEARCH_STEP_DONE)
+        {
+            this->is_done = true;
+            return NULL;
+        }
+
+        if (step.kind == SEARCH_STEP_MATCH)
+        {
+            this->current.start = step.match.start;
+            this->current.end = step.match.end;
+            return &this->current;
+        }
+    }
+}
+
+void MatchesIterator_drop(MatchesIterator *this)
+{
+    StrSearcher_drop(&this->searcher);
+}
+
+Iterator MatchesIterator_to_iter(MatchesIterator *this)
+{
+    Iterator iter;
+    IteratorProps props = {
+        .size = sizeof(*this),
+        .next = (IteratorNextFn)MatchesIterator_next,
+        .drop = (DropFn)MatchesIterator_drop,
+    };
+    Iterator_new(&iter, &props, this);
+
+    return iter;
+}
+
+// [SplitIterator]
+
+typedef struct
+{
+    StrSearcher searcher;
+    size_t last_end;
+    bool is_done;
+    Str current;
+} SplitIterator;
+
+void SplitIterator_new(SplitIterator *this, const StrSearcher *searcher)
+{
+    memcpy(&this->searcher, searcher, sizeof(StrSearcher));
+    this->last_end = 0;
+    this->is_done = false;
+}
+
+void *SplitIterator_next(SplitIterator *this)
+{
+    if (this->is_done)
+    {
+        return NULL;
+    }
+
+    while (true)
+    {
+        SearchStep step = StrSearcher_next(&this->searcher);
+
+        if (step.kind == SEARCH_STEP_MATCH)
+        {
+            size_t start = this->last_end;
+            size_t end = step.match.start;
+
+            this->last_end = step.match.end;
+
+            this->current.ptr = StrSearcher_haystack(&this->searcher).ptr + start;
+            this->current.len = end - start;
+
+            return &this->current;
+        }
+
+        if (step.kind == SEARCH_STEP_DONE)
+        {
+            size_t start = this->last_end;
+            size_t end = StrSearcher_haystack(&this->searcher).len;
+
+            this->is_done = true;
+
+            this->current.ptr = StrSearcher_haystack(&this->searcher).ptr + start;
+            this->current.len = end - start;
+
+            return &this->current;
+        }
+    }
+}
+
+void SplitIterator_drop(SplitIterator *this)
+{
+    StrSearcher_drop(&this->searcher);
+}
+
+Iterator SplitIterator_to_iter(SplitIterator *this)
+{
+    Iterator iter;
+    IteratorProps props = {
+        .size = sizeof(*this),
+        .next = (IteratorNextFn)SplitIterator_next,
+        .drop = (DropFn)SplitIterator_drop,
+    };
+    Iterator_new(&iter, &props, this);
+
+    return iter;
+}
+
 // [String]
 
 typedef struct
@@ -1642,45 +1964,131 @@ void String_new(String *this)
     Vec_new(this->buffer, sizeof(uint8_t), &element_ops);
 }
 
-void String_insert_str(String *this, size_t i, const char *str)
+void String_insert_str(String *this, size_t i, Str str)
 {
-    // check if it is on byte boundary
-
-    size_t length = strlen(str);
-
-    if (length == 0)
+    if (str.len == 0)
     {
         return;
     }
 
     size_t spare_length = Vec_capacity(this->buffer) - Vec_len(this->buffer);
 
-    if (length > spare_length)
+    if (str.len > spare_length)
     {
-        size_t additional = length - spare_length;
+        size_t additional = str.len - spare_length;
         Vec_reserve(this->buffer, additional);
     }
 
     if (i != Vec_len(this->buffer))
     {
-        memmove(Vec_get_mut(this->buffer, i + length), Vec_get(this->buffer, i), Vec_len(this->buffer) - i);
+        memmove(Vec_get_mut(this->buffer, i + str.len), Vec_get(this->buffer, i), Vec_len(this->buffer) - i);
     }
 
-    memcpy(Vec_get_mut(this->buffer, i), str, length);
+    memcpy(Vec_get_mut(this->buffer, i), str.ptr, str.len);
 
-    Vec_set_len(this->buffer, Vec_len(this->buffer) + length);
+    Vec_set_len(this->buffer, Vec_len(this->buffer) + str.len);
 }
 
-void String_from(String *this, const char *str)
+Str String_as_str(String *this)
+{
+    Str result = {
+        .ptr = Vec_get_mut(this->buffer, 0),
+        .len = Vec_len(this->buffer),
+    };
+    return result;
+}
+
+void String_push_str(String *this, Str str)
+{
+    String_insert_str(this, Vec_len(this->buffer), str);
+}
+
+size_t String_find_str(String *this, Str needle)
+{
+    StrSearcher searcher;
+    StrSearcher_new(&searcher, String_as_str(this), needle);
+
+    size_t result = SIZE_MAX;
+
+    while (true)
+    {
+        SearchStep step = StrSearcher_next(&searcher);
+
+        if (step.kind == SEARCH_STEP_DONE)
+        {
+            break;
+        }
+
+        if (step.kind == SEARCH_STEP_MATCH)
+        {
+            result = step.match.start;
+            break;
+        }
+    }
+
+    return result;
+}
+
+String String_replace_str(String *this, Str from, Str to)
+{
+    StrSearcher searcher;
+    StrSearcher_new(&searcher, String_as_str(this), from);
+
+    String result;
+    String_new(&result);
+
+    while (true)
+    {
+        SearchStep step = StrSearcher_next(&searcher);
+
+        if (step.kind == SEARCH_STEP_MATCH)
+        {
+            String_push_str(&result, to);
+        }
+        else if (step.kind == SEARCH_STEP_REJECT)
+        {
+            Str str = {
+                .ptr = Vec_get_mut(this->buffer, 0) + step.reject.start,
+                .len = step.reject.end - step.reject.start,
+            };
+            String_push_str(&result, str);
+        }
+        else if (step.kind == SEARCH_STEP_DONE)
+        {
+            break;
+        }
+    }
+
+    return result;
+}
+
+MatchesIterator String_matches_str(String *this, Str needle)
+{
+    StrSearcher searcher;
+    StrSearcher_new(&searcher, String_as_str(this), needle);
+
+    MatchesIterator matches;
+    MatchesIterator_new(&matches, &searcher);
+
+    return matches;
+}
+
+SplitIterator String_split_str(String *this, Str separator)
+{
+    StrSearcher searcher;
+    StrSearcher_new(&searcher, String_as_str(this), separator);
+
+    SplitIterator split;
+    SplitIterator_new(&split, &searcher);
+
+    return split;
+}
+
+void String_from(String *this, Str str)
 {
     String_new(this);
 
     String_insert_str(this, 0, str);
-}
-
-void String_push_str(String *this, const char *str)
-{
-    String_insert_str(this, Vec_len(this->buffer), str);
 }
 
 void String_reserve(String *this, size_t additional)
@@ -2086,58 +2494,125 @@ int main(int argc, const char **argv)
     }
 
     {
-        String s1;
-        String_new(&s1);
+        String s;
+        String_new(&s);
+        assert(String_len(&s) == 0);
+        assert(String_capacity(&s) >= 0);
+        String_drop(&s);
 
-        assert(String_len(&s1) == 0);
-        assert(String_capacity(&s1) == 0);
+        String_from(&s, Str_from_cstr("hello"));
+        assert(String_len(&s) == 5);
+        assert(memcmp(Vec_get(s.buffer, 0), "hello", 5) == 0);
+        String_drop(&s);
 
-        String_drop(&s1);
+        String_new(&s);
+        String_push_str(&s, Str_from_cstr("abc"));
+        assert(String_len(&s) == 3);
+        assert(memcmp(Vec_get(s.buffer, 0), "abc", 3) == 0);
 
-        String s2;
-        String_from(&s2, "hello");
+        String_push_str(&s, Str_from_cstr("def"));
+        assert(String_len(&s) == 6);
+        assert(memcmp(Vec_get(s.buffer, 0), "abcdef", 6) == 0);
+        String_drop(&s);
 
-        assert(String_len(&s2) == 5);
-        assert(memcmp(Vec_get(s2.buffer, 0), "hello", 5) == 0);
+        String_from(&s, Str_from_cstr("HelloWorld"));
 
-        String_drop(&s2);
+        String_insert_str(&s, 5, Str_from_cstr(" "));
+        assert(memcmp(Vec_get(s.buffer, 0), "Hello World", 11) == 0);
 
-        String s3;
-        String_new(&s3);
+        String_insert_str(&s, 0, Str_from_cstr("C"));
+        assert(memcmp(Vec_get(s.buffer, 0), "CHello World", 12) == 0);
 
-        String_push_str(&s3, "abc");
-        assert(String_len(&s3) == 3);
-        assert(memcmp(Vec_get(s3.buffer, 0), "abc", 3) == 0);
+        String_insert_str(&s, String_len(&s), Str_from_cstr("!"));
+        assert(memcmp(Vec_get(s.buffer, 0), "CHello World!", 13) == 0);
+        String_drop(&s);
 
-        String_push_str(&s3, "def");
-        assert(String_len(&s3) == 6);
-        assert(memcmp(Vec_get(s3.buffer, 0), "abcdef", 6) == 0);
+        String_new(&s);
+        String_reserve(&s, 10);
+        assert(String_capacity(&s) >= 10);
+        assert(String_len(&s) == 0);
+        String_drop(&s);
 
-        String_drop(&s3);
+        String_from(&s, Str_from_cstr("abcdef"));
+        String_truncate(&s, 3);
+        assert(String_len(&s) == 3);
+        assert(memcmp(Vec_get(s.buffer, 0), "abc", 3) == 0);
+        String_drop(&s);
 
-        String s4;
-        String_from(&s4, "HelloWorld");
+        String_from(&s, Str_from_cstr("test"));
+        String_clear(&s);
+        assert(String_len(&s) == 0);
+        String_drop(&s);
 
-        String_insert_str(&s4, 5, " ");
-        assert(String_len(&s4) == strlen("Hello World"));
-        assert(memcmp(Vec_get(s4.buffer, 0), "Hello World", 11) == 0);
+        String_from(&s, Str_from_cstr("abcdabc"));
+        size_t pos = String_find_str(&s, Str_from_cstr("da"));
+        assert(pos == 3);
+        String_drop(&s);
 
-        String_insert_str(&s4, 0, "C");
-        assert(memcmp(Vec_get(s4.buffer, 0), "CHello World", 12) == 0);
+        String_from(&s, Str_from_cstr("12345"));
+        String_reserve(&s, 100);
+        size_t before = String_capacity(&s);
+        String_shrink_to_fit(&s);
+        size_t after = String_capacity(&s);
+        assert(after <= before);
+        String_drop(&s);
 
-        String_insert_str(&s4, String_len(&s4), "!");
-        assert(memcmp(Vec_get(s4.buffer, 0), "CHello World!", 13) == 0);
+        // --- String_replace_str ---
+        {
+            String s;
+            String_from(&s, Str_from_cstr("the cat sat on the mat"));
+            String replaced = String_replace_str(&s, Str_from_cstr("at"), Str_from_cstr("og"));
 
-        String_drop(&s4);
+            assert(memcmp(Vec_get(replaced.buffer, 0), "the cog sog on the mog", 23) == 0);
 
-        String s5;
-        String_new(&s5);
+            String_drop(&replaced);
+            String_drop(&s);
+        }
 
-        String_reserve(&s5, 10);
-        assert(String_capacity(&s5) >= 10);
-        assert(String_len(&s5) == 0);
+        // --- String_matches_str ---
+        {
+            String s;
+            String_from(&s, Str_from_cstr("banana"));
+            MatchesIterator matches = String_matches_str(&s, Str_from_cstr("ana"));
 
-        String_drop(&s5);
+            size_t starts[4];
+            size_t count = 0;
+
+            Match *m;
+            while ((m = (Match *)MatchesIterator_next(&matches)) != NULL)
+            {
+                starts[count++] = m->start;
+            }
+
+            assert(count == 1);
+            assert(starts[0] == 1);
+
+            MatchesIterator_drop(&matches);
+            String_drop(&s);
+        }
+
+        // --- String_split_str ---
+        {
+            String s;
+            String_from(&s, Str_from_cstr("one,two,three"));
+            SplitIterator split = String_split_str(&s, Str_from_cstr(","));
+
+            Str *part;
+            const char *expected[] = {"one", "two", "three"};
+            size_t i = 0;
+
+            while ((part = (Str *)SplitIterator_next(&split)) != NULL)
+            {
+                assert(part->len == strlen(expected[i]));
+                assert(memcmp(part->ptr, expected[i], part->len) == 0);
+                i++;
+            }
+
+            assert(i == 3);
+
+            SplitIterator_drop(&split);
+            String_drop(&s);
+        }
     }
 
     return 0;
