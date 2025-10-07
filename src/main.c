@@ -12,6 +12,111 @@ typedef void (*DropFn)(void *this);
 typedef int_fast8_t (*CmpFn)(const void *a, const void *b);
 typedef bool (*EqFn)(const void *a, const void *b);
 
+// [MaybeOwned]
+
+typedef enum
+{
+    MAYBE_OWNED_KIND_OWNED,
+    MAYBE_OWNED_KIND_BORROWED,
+} MaybeOwnedKind;
+
+typedef struct
+{
+    size_t size;
+    DropFn drop;
+} MaybeOwnedOwnedProps;
+
+typedef struct
+{
+    MaybeOwnedKind kind;
+
+    union
+    {
+        struct
+        {
+            void *value;
+            MaybeOwnedOwnedProps props;
+        } owned;
+
+        struct
+        {
+            void *value;
+        } borrowed;
+    };
+} MaybeOwned;
+
+MaybeOwned MaybeOwned_owned(void *value, const MaybeOwnedOwnedProps *props)
+{
+    MaybeOwned this;
+
+    this.kind = MAYBE_OWNED_KIND_OWNED;
+    this.owned.props = *props;
+
+    this.owned.value = malloc(this.owned.props.size);
+    memcpy(this.owned.value, value, this.owned.props.size);
+
+    return this;
+}
+
+MaybeOwned MaybeOwned_borrowed(void *value)
+{
+    MaybeOwned this;
+
+    this.kind = MAYBE_OWNED_KIND_BORROWED;
+    this.borrowed.value = value;
+
+    return this;
+}
+
+void *MaybeOwned_value(const MaybeOwned *this)
+{
+    return this->kind == MAYBE_OWNED_KIND_BORROWED ? this->borrowed.value : this->owned.value;
+}
+
+void MaybeOwned_drop(MaybeOwned *this)
+{
+    if (this->kind == MAYBE_OWNED_KIND_OWNED)
+    {
+        if (this->owned.props.drop != NULL)
+        {
+            this->owned.props.drop(this->owned.value);
+        }
+
+        free(this->owned.value);
+    }
+}
+
+// [Iter]
+
+typedef void *(*IterNextFn)(void *this);
+
+typedef struct
+{
+    IterNextFn next;
+} IterProps;
+
+typedef struct
+{
+    MaybeOwned concrete;
+    IterProps props;
+} Iter;
+
+void Iter_new(Iter *this, const IterProps *props, const MaybeOwned *concrete)
+{
+    this->props = *props;
+    this->concrete = *concrete;
+}
+
+void *Iter_next(Iter *this)
+{
+    return this->props.next(MaybeOwned_value(&this->concrete));
+}
+
+void Iter_drop(Iter *this)
+{
+    MaybeOwned_drop(&this->concrete);
+}
+
 // [Vec]
 
 typedef struct
@@ -1419,6 +1524,16 @@ void HashMap_with_capacity_and_hasher(HashMap *this, const HashMapKeyProps *key_
     }
 }
 
+size_t HashMap_len(const HashMap *this)
+{
+    return this->length;
+}
+
+size_t HashMap_capacity(const HashMap *this)
+{
+    return this->capacity;
+}
+
 void HashMap_insert(HashMap *this, void *key, void *value);
 
 static void _HashMap_grow(HashMap *this)
@@ -1489,7 +1604,11 @@ void HashMap_insert(HashMap *this, void *key, void *value)
 
         if (this->key_props.eq(_HashMapEntry_key(entry), _HashMapEntry_key(current_entry)))
         {
-            this->value_props.drop(_HashMapEntry_value(current_entry, this));
+            if (this->value_props.drop != NULL)
+            {
+                this->value_props.drop(_HashMapEntry_value(current_entry, this));
+            }
+
             memcpy(_HashMapEntry_value(current_entry, this), _HashMapEntry_value(entry, this), ROUND_SIZE_UP_TO_MAX_ALIGN(this->value_props.size));
             break;
         }
@@ -1586,7 +1705,13 @@ void HashMap_remove(HashMap *this, void *key)
     }
 
     this->key_props.drop(_HashMapEntry_key(_HashMap_entry_at(this, slot)));
-    this->value_props.drop(_HashMapEntry_value(_HashMap_entry_at(this, slot), this));
+
+    if (this->value_props.drop)
+    {
+        this->value_props.drop(_HashMapEntry_value(_HashMap_entry_at(this, slot), this));
+    }
+
+    this->length--;
 
     size_t next_slot = (slot + 1) % this->capacity;
 
@@ -1618,13 +1743,428 @@ void HashMap_drop(HashMap *this)
         if (!entry->is_empty)
         {
             this->key_props.drop(_HashMapEntry_key(entry));
-            this->value_props.drop(_HashMapEntry_value(entry, this));
+
+            if (this->value_props.drop != NULL)
+            {
+                this->value_props.drop(_HashMapEntry_value(entry, this));
+            }
         }
     }
 
     Hasher_drop(&this->hasher);
 
     free(this->entries);
+}
+
+// [HashSet]
+
+typedef struct
+{
+    size_t size;
+    EqFn eq;
+    HashFn hash;
+    DropFn drop;
+} HashSetElementProps;
+
+typedef struct
+{
+    HashMap *map;
+} HashSet;
+
+void HashSet_with_capacity_and_hasher(HashSet *this, const HashSetElementProps *element_props, size_t capacity, const Hasher *hasher)
+{
+    this->map = malloc(sizeof(*this->map));
+
+    HashMapKeyProps key_props = {
+        .size = element_props->size,
+        .eq = element_props->eq,
+        .hash = element_props->hash,
+        .drop = element_props->drop,
+    };
+    HashMapValueProps value_props = {
+        .size = sizeof(uint8_t),
+    };
+    HashMap_with_capacity_and_hasher(this->map, &key_props, &value_props, capacity, hasher);
+}
+
+void HashSet_with_hasher(HashSet *this, const HashSetElementProps *element_props, const Hasher *hasher)
+{
+    this->map = malloc(sizeof(*this->map));
+
+    HashMapKeyProps key_props = {
+        .size = element_props->size,
+        .eq = element_props->eq,
+        .hash = element_props->hash,
+        .drop = element_props->drop,
+    };
+    HashMapValueProps value_props = {
+        .size = sizeof(uint8_t),
+    };
+    HashMap_with_hasher(this->map, &key_props, &value_props, hasher);
+}
+
+void HashSet_new(HashSet *this, const HashSetElementProps *element_props)
+{
+    this->map = malloc(sizeof(*this->map));
+
+    HashMapKeyProps key_props = {
+        .size = element_props->size,
+        .eq = element_props->eq,
+        .hash = element_props->hash,
+        .drop = element_props->drop,
+    };
+    HashMapValueProps value_props = {
+        .size = sizeof(uint8_t),
+    };
+    HashMap_new(this->map, &key_props, &value_props);
+}
+
+void HashSet_insert(HashSet *this, void *element)
+{
+    uint8_t i = 0;
+    HashMap_insert(this->map, element, &i);
+}
+
+size_t HashSet_len(const HashSet *this)
+{
+    return HashMap_len(this->map);
+}
+
+size_t HashSet_capacity(const HashSet *this)
+{
+    return HashMap_capacity(this->map);
+}
+
+bool HashSet_contains(const HashSet *this, void *element)
+{
+    return HashMap_get(this->map, element) == NULL ? false : true;
+}
+
+// [HashSetUnionIter]
+
+typedef enum
+{
+    HASH_SET_UNION_ITER_PHASE_A,
+    HASH_SET_UNION_ITER_PHASE_B,
+    HASH_SET_UNION_ITER_PHASE_DONE,
+} HashSetUnionIterPhase;
+
+typedef struct
+{
+    const HashSet *a;
+    const HashSet *b;
+    HashSetUnionIterPhase phase;
+    size_t current;
+} HashSetUnionIter;
+
+void HashSetUnionIter_new(HashSetUnionIter *this, const HashSet *a, const HashSet *b)
+{
+    this->a = a;
+    this->b = b;
+
+    this->phase = HASH_SET_UNION_ITER_PHASE_A;
+    this->current = 0;
+}
+
+void *HashSetUnionIter_next(HashSetUnionIter *this)
+{
+    if (this->phase == HASH_SET_UNION_ITER_PHASE_DONE)
+    {
+        return NULL;
+    }
+
+    if (this->phase == HASH_SET_UNION_ITER_PHASE_A)
+    {
+        size_t i;
+        for (i = this->current; i < HashSet_capacity(this->a); i++)
+        {
+            _HashMapEntry *entry = _HashMap_entry_at(this->a->map, i);
+
+            if (!entry->is_empty)
+            {
+                break;
+            }
+        }
+
+        if (i == HashSet_capacity(this->a))
+        {
+            this->phase = HASH_SET_UNION_ITER_PHASE_B;
+            this->current = 0;
+        }
+        else
+        {
+            this->current = i + 1;
+            return _HashMapEntry_key(_HashMap_entry_at(this->a->map, i));
+        }
+    }
+
+    if (this->phase == HASH_SET_UNION_ITER_PHASE_B)
+    {
+        size_t i;
+        for (i = this->current; i < HashSet_capacity(this->b); i++)
+        {
+            _HashMapEntry *entry = _HashMap_entry_at(this->b->map, i);
+
+            if (!entry->is_empty && !HashSet_contains(this->a, _HashMapEntry_key(entry)))
+            {
+                break;
+            }
+        }
+
+        if (i == HashSet_capacity(this->b))
+        {
+            this->phase = HASH_SET_UNION_ITER_PHASE_DONE;
+        }
+        else
+        {
+            this->current = i + 1;
+            return _HashMapEntry_key(_HashMap_entry_at(this->b->map, i));
+        }
+    }
+
+    return NULL;
+}
+
+void HashSetUnionIter_drop(HashSetUnionIter *this)
+{
+}
+
+// [HashSetIntersectionIter]
+
+typedef struct
+{
+    const HashSet *a;
+    const HashSet *b;
+    size_t current;
+    bool is_done;
+} HashSetIntersectionIter;
+
+void HashSetIntersectionIter_new(HashSetIntersectionIter *this, const HashSet *a, const HashSet *b)
+{
+    this->a = a;
+    this->b = b;
+
+    this->current = 0;
+    this->is_done = false;
+}
+
+void *HashSetIntersectionIter_next(HashSetIntersectionIter *this)
+{
+    if (this->is_done)
+    {
+        return NULL;
+    }
+
+    size_t i;
+    for (i = this->current; i < HashSet_capacity(this->a); i++)
+    {
+        _HashMapEntry *entry = _HashMap_entry_at(this->a->map, i);
+
+        if (!entry->is_empty && HashSet_contains(this->b, _HashMapEntry_key(entry)))
+        {
+            break;
+        }
+    }
+
+    if (i == HashSet_capacity(this->b))
+    {
+        this->is_done = true;
+        return NULL;
+    }
+    else
+    {
+        this->current = i + 1;
+        return _HashMapEntry_key(_HashMap_entry_at(this->a->map, i));
+    }
+}
+
+void HashSetIntersectionIter_drop(HashSetIntersectionIter *this)
+{
+}
+
+// [HashSetDifferenceIter]
+
+typedef struct
+{
+    const HashSet *a;
+    const HashSet *b;
+    size_t current;
+    bool is_done;
+} HashSetDifferenceIter;
+
+void HashSetDifferenceIter_new(HashSetDifferenceIter *this, const HashSet *a, const HashSet *b)
+{
+    this->a = a;
+    this->b = b;
+
+    this->current = 0;
+    this->is_done = false;
+}
+
+void *HashSetDifferenceIter_next(HashSetDifferenceIter *this)
+{
+    if (this->is_done)
+    {
+        return NULL;
+    }
+
+    size_t i;
+    for (i = this->current; i < HashSet_capacity(this->a); i++)
+    {
+        _HashMapEntry *entry = _HashMap_entry_at(this->a->map, i);
+
+        if (!entry->is_empty && !HashSet_contains(this->b, _HashMapEntry_key(entry)))
+        {
+            break;
+        }
+    }
+
+    if (i == HashSet_capacity(this->b))
+    {
+        this->is_done = true;
+        return NULL;
+    }
+    else
+    {
+        this->current = i + 1;
+        return _HashMapEntry_key(_HashMap_entry_at(this->a->map, i));
+    }
+}
+
+void HashSetDifferenceIter_drop(HashSetDifferenceIter *this)
+{
+}
+
+// [HashSetSymmetricDifferenceIter]
+
+typedef enum
+{
+    HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_A,
+    HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_B,
+    HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_DONE,
+} HashSetSymmetricDifferenceIterPhase;
+
+typedef struct
+{
+    const HashSet *a;
+    const HashSet *b;
+    HashSetSymmetricDifferenceIterPhase phase;
+    size_t current;
+} HashSetSymmetricDifferenceIter;
+
+void HashSetSymmetricDifferenceIter_new(HashSetSymmetricDifferenceIter *this, const HashSet *a, const HashSet *b)
+{
+    this->a = a;
+    this->b = b;
+
+    this->phase = HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_A;
+    this->current = 0;
+}
+
+void *HashSetSymmetricDifferenceIter_next(HashSetSymmetricDifferenceIter *this)
+{
+    if (this->phase == HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_DONE)
+    {
+        return NULL;
+    }
+
+    if (this->phase == HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_A)
+    {
+        size_t i;
+        for (i = this->current; i < HashSet_capacity(this->a); i++)
+        {
+            _HashMapEntry *entry = _HashMap_entry_at(this->a->map, i);
+
+            if (!entry->is_empty && !HashSet_contains(this->b, _HashMapEntry_key(entry)))
+            {
+                break;
+            }
+        }
+
+        if (i == HashSet_capacity(this->a))
+        {
+            this->phase = HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_B;
+            this->current = 0;
+        }
+        else
+        {
+            this->current = i + 1;
+            return _HashMapEntry_key(_HashMap_entry_at(this->a->map, i));
+        }
+    }
+
+    if (this->phase == HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_B)
+    {
+        size_t i;
+        for (i = this->current; i < HashSet_capacity(this->b); i++)
+        {
+            _HashMapEntry *entry = _HashMap_entry_at(this->b->map, i);
+
+            if (!entry->is_empty && !HashSet_contains(this->a, _HashMapEntry_key(entry)))
+            {
+                break;
+            }
+        }
+
+        if (i == HashSet_capacity(this->b))
+        {
+            this->phase = HASH_SET_SYMMETRIC_DIFFERENCE_ITER_PHASE_DONE;
+        }
+        else
+        {
+            this->current = i + 1;
+            return _HashMapEntry_key(_HashMap_entry_at(this->b->map, i));
+        }
+    }
+
+    return NULL;
+}
+
+void HashSetSymmetricDifferenceIter_drop(HashSetSymmetricDifferenceIter *this)
+{
+}
+
+HashSetUnionIter HashSet_union(const HashSet *this, const HashSet *other)
+{
+    HashSetUnionIter iter;
+    HashSetUnionIter_new(&iter, this, other);
+
+    return iter;
+}
+
+HashSetIntersectionIter HashSet_intersection(const HashSet *this, const HashSet *other)
+{
+    HashSetIntersectionIter iter;
+    HashSetIntersectionIter_new(&iter, this, other);
+
+    return iter;
+}
+
+HashSetDifferenceIter HashSet_difference(const HashSet *this, const HashSet *other)
+{
+    HashSetDifferenceIter iter;
+    HashSetDifferenceIter_new(&iter, this, other);
+
+    return iter;
+}
+
+HashSetSymmetricDifferenceIter HashSet_symmetric_difference(const HashSet *this, const HashSet *other)
+{
+    HashSetSymmetricDifferenceIter iter;
+    HashSetSymmetricDifferenceIter_new(&iter, this, other);
+
+    return iter;
+}
+
+void HashSet_remove(HashSet *this, void *element)
+{
+    HashMap_remove(this->map, element);
+}
+
+void HashSet_drop(HashSet *this)
+{
+    HashMap_drop(this->map);
+    free(this->map);
 }
 
 // [Str]
@@ -1770,46 +2310,6 @@ static void StrSearcher_drop(StrSearcher *this)
 {
 }
 
-// [Iterator]
-
-typedef void *(*IteratorNextFn)(void *this);
-
-typedef struct
-{
-    size_t size;
-    IteratorNextFn next;
-    DropFn drop;
-} IteratorProps;
-
-typedef struct
-{
-    void *concrete;
-    IteratorProps props;
-} Iterator;
-
-void Iterator_new(Iterator *this, const IteratorProps *props, void *concrete)
-{
-    this->props = *props;
-
-    this->concrete = malloc(this->props.size);
-    memcpy(this->concrete, concrete, this->props.size);
-}
-
-void *Iterator_next(Iterator *this)
-{
-    return this->props.next(this->concrete);
-}
-
-void Iterator_drop(Iterator *this)
-{
-    if (this->props.drop != NULL)
-    {
-        this->props.drop(this->concrete);
-    }
-
-    free(this->concrete);
-}
-
 // [MatchesIterator]
 
 typedef struct
@@ -1860,19 +2360,6 @@ void *MatchesIterator_next(MatchesIterator *this)
 void MatchesIterator_drop(MatchesIterator *this)
 {
     StrSearcher_drop(&this->searcher);
-}
-
-Iterator MatchesIterator_to_iter(MatchesIterator *this)
-{
-    Iterator iter;
-    IteratorProps props = {
-        .size = sizeof(*this),
-        .next = (IteratorNextFn)MatchesIterator_next,
-        .drop = (DropFn)MatchesIterator_drop,
-    };
-    Iterator_new(&iter, &props, this);
-
-    return iter;
 }
 
 // [SplitIterator]
@@ -1934,19 +2421,6 @@ void *SplitIterator_next(SplitIterator *this)
 void SplitIterator_drop(SplitIterator *this)
 {
     StrSearcher_drop(&this->searcher);
-}
-
-Iterator SplitIterator_to_iter(SplitIterator *this)
-{
-    Iterator iter;
-    IteratorProps props = {
-        .size = sizeof(*this),
-        .next = (IteratorNextFn)SplitIterator_next,
-        .drop = (DropFn)SplitIterator_drop,
-    };
-    Iterator_new(&iter, &props, this);
-
-    return iter;
 }
 
 // [String]
@@ -2129,6 +2603,16 @@ void String_drop(String *this)
 
 #include <stdint.h>
 
+bool eq_u8(const uint8_t *a, const uint8_t *b)
+{
+    return *a == *b;
+}
+
+void hash_u8(const uint8_t *key, Hasher *hasher)
+{
+    Hasher_write(hasher, key, sizeof(uint8_t));
+}
+
 int32_t compare_u8(const uint8_t *a, const uint8_t *b)
 {
     if (*a > *b)
@@ -2143,16 +2627,6 @@ int32_t compare_u8(const uint8_t *a, const uint8_t *b)
     {
         return -1;
     }
-}
-
-bool eq_u8(const void *a, const void *b)
-{
-    return *(const uint8_t *)a == *(const uint8_t *)b;
-}
-
-void hash_u8(const void *key, Hasher *hasher)
-{
-    Hasher_write(hasher, key, sizeof(uint8_t));
 }
 
 void drop_nop(void *ptr)
@@ -2442,8 +2916,8 @@ int main(int argc, const char **argv)
     {
         HashMapKeyProps key_props = {
             .size = sizeof(uint8_t),
-            .eq = eq_u8,
-            .hash = hash_u8,
+            .eq = (EqFn)eq_u8,
+            .hash = (HashFn)hash_u8,
             .drop = drop_nop,
         };
 
@@ -2491,6 +2965,112 @@ int main(int argc, const char **argv)
         assert(value == NULL);
 
         HashMap_drop(&map);
+    }
+
+    {
+        HashSetElementProps elem_props = {
+            .size = sizeof(uint8_t),
+            .eq = (EqFn)eq_u8,
+            .hash = (HashFn)hash_u8,
+            .drop = drop_nop,
+        };
+
+        HashSet set;
+        HashSet_new(&set, &elem_props);
+
+        for (uint8_t i = 1; i <= 3; i++)
+        {
+            HashSet_insert(&set, &i);
+        }
+
+        for (uint8_t i = 1; i <= 3; i++)
+        {
+            assert(HashSet_contains(&set, &i));
+        }
+
+        uint8_t not_present = 99;
+        assert(!HashSet_contains(&set, &not_present));
+
+        size_t before = HashSet_len(&set);
+        uint8_t dup = 2;
+        HashSet_insert(&set, &dup);
+        assert(HashSet_len(&set) == before);
+
+        uint8_t key = 2;
+        HashSet_remove(&set, &key);
+        assert(!HashSet_contains(&set, &key));
+
+        HashSet_remove(&set, &not_present);
+
+        assert(HashSet_len(&set) == 2);
+
+        // --- HashSet_union ---
+        HashSet other;
+        HashSet_new(&other, &elem_props);
+
+        uint8_t a = 3, b = 4, c = 5;
+        HashSet_insert(&other, &a);
+        HashSet_insert(&other, &b);
+        HashSet_insert(&other, &c);
+
+        HashSetUnionIter u = HashSet_union(&set, &other);
+
+        uint8_t union_elems[6];
+        (void)union_elems;
+
+        size_t union_count = 0;
+        void *key_ptr;
+        while ((key_ptr = HashSetUnionIter_next(&u)))
+        {
+            union_elems[union_count++] = *(uint8_t *)key_ptr;
+        }
+
+        // Union should contain {1, 3, 4, 5}
+        assert(union_count == 4);
+
+        // --- HashSet_intersection ---
+        HashSetIntersectionIter inter = HashSet_intersection(&set, &other);
+        uint8_t inter_elems[6];
+        size_t inter_count = 0;
+        while ((key_ptr = HashSetIntersectionIter_next(&inter)))
+        {
+            inter_elems[inter_count++] = *(uint8_t *)key_ptr;
+        }
+
+        // Only common element is 3
+        assert(inter_count == 1);
+        assert(inter_elems[0] == 3);
+
+        // --- HashSet_difference ---
+        HashSetDifferenceIter diff = HashSet_difference(&set, &other);
+        uint8_t diff_elems[6];
+        (void)diff_elems;
+
+        size_t diff_count = 0;
+        while ((key_ptr = HashSetDifferenceIter_next(&diff)))
+        {
+            diff_elems[diff_count++] = *(uint8_t *)key_ptr;
+        }
+        // set = {1, 3}, other = {3, 4, 5}, difference = {1}
+        assert(diff_count == 1);
+        assert(diff_elems[0] == 1);
+
+        // --- HashSet_symmetric_difference ---
+        HashSetSymmetricDifferenceIter sym = HashSet_symmetric_difference(&set, &other);
+        uint8_t sym_elems[6];
+        (void)sym_elems;
+
+        size_t sym_count = 0;
+        while ((key_ptr = HashSetSymmetricDifferenceIter_next(&sym)))
+        {
+            sym_elems[sym_count++] = *(uint8_t *)key_ptr;
+        }
+
+        // sym diff = {1, 4, 5}
+        assert(sym_count == 3);
+
+        HashSet_drop(&set);
+        HashSet_drop(&other);
     }
 
     {
