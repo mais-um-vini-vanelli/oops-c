@@ -977,6 +977,11 @@ static void _BTreeMap_fix_overflow_up(BTreeMap *this, _BTreeMapNode *node)
     }
 }
 
+size_t BTreeMap_len(const BTreeMap *this)
+{
+    return this->length;
+}
+
 void BTreeMap_insert(BTreeMap *this, const void *key, const void *value)
 {
     BTreeMapEntry new_entry = _BTreeMapEntry_new((void *)key, (void *)value);
@@ -991,6 +996,8 @@ void BTreeMap_insert(BTreeMap *this, const void *key, const void *value)
     else
     {
         _BTreeMap_insert_entry_at(this, &new_entry, &result.go_down);
+
+        this->length += 1;
 
         _BTreeMap_fix_overflow_up(this, result.go_down.node);
     }
@@ -1136,6 +1143,8 @@ void BTreeMap_remove(BTreeMap *this, const void *key)
     _BTreeMap_drop_entry_at(this, &entry_pos);
     _BTreeMap_remove_entry_at(this, &entry_pos);
 
+    this->length -= 1;
+
     _BTreeMap_fix_underflow_up(this, entry_pos.node);
 }
 
@@ -1249,6 +1258,510 @@ BTreeMapRangeIter BTreeMap_range(const BTreeMap *this, const RangeBound *start, 
 {
     BTreeMapRangeIter iter;
     BTreeMapRangeIter_new(&iter, this, start, end);
+
+    return iter;
+}
+
+// [BTreeSet]
+
+typedef struct
+{
+    size_t size;
+    CmpFn cmp;
+    DropFn drop;
+} BTreeSetElementProps;
+
+typedef struct
+{
+    BTreeMap *map;
+} BTreeSet;
+
+void BTreeSet_new(BTreeSet *this, const BTreeSetElementProps *element_props)
+{
+    this->map = malloc(sizeof(*this->map));
+
+    BTreeMapKeyProps key_props = {
+        .size = element_props->size,
+        .cmp = element_props->cmp,
+        .drop = element_props->drop,
+    };
+    BTreeMapValueProps value_props = {
+        .size = sizeof(uint8_t),
+    };
+    BTreeMap_new(this->map, &key_props, &value_props);
+}
+
+bool BTreeSet_contains(const BTreeSet *this, const void *element)
+{
+    return BTreeMap_get(this->map, element) == NULL ? false : true;
+}
+
+size_t BTreeSet_len(const BTreeSet *this)
+{
+    return BTreeMap_len(this->map);
+}
+
+void BTreeSet_drop(BTreeSet *this)
+{
+    BTreeMap_drop(this->map);
+    free(this->map);
+}
+
+void BTreeSet_insert(BTreeSet *this, const void *element)
+{
+    uint8_t i = 0;
+    BTreeMap_insert(this->map, element, &i);
+}
+
+void BTreeSet_remove(BTreeSet *this, const void *element)
+{
+    BTreeMap_remove(this->map, element);
+}
+
+// [BTreeSetRangeIter]
+
+typedef struct
+{
+    BTreeMapRangeIter *iter;
+} BTreeSetRangeIter;
+
+void BTreeSetRangeIter_new(BTreeSetRangeIter *this, const BTreeSet *set, const RangeBound *start, const RangeBound *end)
+{
+    this->iter = malloc(sizeof(*this->iter));
+    BTreeMapRangeIter_new(this->iter, set->map, start, end);
+}
+
+void *BTreeSetRangeIter_next(BTreeSetRangeIter *this)
+{
+    BTreeMapEntry *next = BTreeMapRangeIter_next(this->iter);
+
+    return next == NULL ? NULL : next->key;
+}
+
+void *BTreeSetRangeIter_next_back(BTreeSetRangeIter *this)
+{
+    BTreeMapEntry *next = BTreeMapRangeIter_next_back(this->iter);
+
+    return next == NULL ? NULL : next->key;
+}
+
+void BTreeSetRangeIter_drop(BTreeSetRangeIter *this)
+{
+    BTreeMapRangeIter_drop(this->iter);
+}
+
+BTreeSetRangeIter BTreeSet_range(const BTreeSet *this, const RangeBound *start, const RangeBound *end)
+{
+    BTreeSetRangeIter iter;
+    BTreeSetRangeIter_new(&iter, this, start, end);
+
+    return iter;
+}
+
+// [BTreeSetUnionIter]
+
+typedef enum
+{
+    BTREE_SET_UNION_ITER_SIDE_A,
+    BTREE_SET_UNION_ITER_SIDE_B,
+} BTreeSetUnionIterSide;
+
+typedef struct
+{
+    const BTreeSet *a;
+    const BTreeSet *b;
+    BTreeMapEntryPos current_a;
+    bool a_is_done;
+    BTreeMapEntryPos current_b;
+    bool b_is_done;
+} BTreeSetUnionIter;
+
+void BTreeSetUnionIter_new(BTreeSetUnionIter *this, const BTreeSet *a, const BTreeSet *b)
+{
+    this->a = a;
+    this->b = b;
+
+    if (BTreeSet_len(this->a) == 0)
+    {
+        this->a_is_done = true;
+    }
+    else
+    {
+        this->current_a = BTreeMapEntryPos_new(_BTreeMap_leftmost(this->a->map), 0);
+        this->a_is_done = false;
+    }
+
+    if (BTreeSet_len(this->b) == 0)
+    {
+        this->a_is_done = true;
+    }
+    else
+    {
+        this->current_b = BTreeMapEntryPos_new(_BTreeMap_leftmost(this->b->map), 0);
+        this->b_is_done = false;
+    }
+}
+
+void *BTreeSetUnionIter_next(BTreeSetUnionIter *this)
+{
+    if (this->a_is_done && this->b_is_done)
+    {
+        return NULL;
+    }
+
+    BTreeSetUnionIterSide should_advance;
+
+    if (this->a_is_done)
+    {
+        should_advance = BTREE_SET_UNION_ITER_SIDE_B;
+    }
+    else if (this->b_is_done)
+    {
+        should_advance = BTREE_SET_UNION_ITER_SIDE_A;
+    }
+    else
+    {
+        BTreeMapEntry current_a = BTreeMapEntryPos_to_entry(this->current_a, this->a->map);
+        BTreeMapEntry current_b = BTreeMapEntryPos_to_entry(this->current_b, this->b->map);
+
+        int_fast8_t result = this->a->map->key_props.cmp(current_a.key, current_b.key);
+
+        if (result == 0)
+        {
+            this->current_b = _BTreeMap_next_inorder(this->b->map, &this->current_b);
+            this->b_is_done = this->current_b.node == NULL ? true : false;
+
+            should_advance = BTREE_SET_UNION_ITER_SIDE_A;
+        }
+        else
+        {
+            should_advance = result > 0 ? BTREE_SET_UNION_ITER_SIDE_B : BTREE_SET_UNION_ITER_SIDE_A;
+        }
+    }
+
+    BTreeMapEntry current;
+
+    if (should_advance == BTREE_SET_UNION_ITER_SIDE_A)
+    {
+        current = BTreeMapEntryPos_to_entry(this->current_a, this->a->map);
+        this->current_a = _BTreeMap_next_inorder(this->a->map, &this->current_a);
+        this->a_is_done = this->current_a.node == NULL ? true : false;
+    }
+    else
+    {
+        current = BTreeMapEntryPos_to_entry(this->current_b, this->b->map);
+        this->current_b = _BTreeMap_next_inorder(this->b->map, &this->current_b);
+        this->b_is_done = this->current_b.node == NULL ? true : false;
+    }
+
+    return current.key;
+}
+
+void BTreeSetUnionIter_drop(BTreeSetUnionIter *this)
+{
+}
+
+BTreeSetUnionIter BTreeSet_union(const BTreeSet *this, const BTreeSet *other)
+{
+    BTreeSetUnionIter iter;
+    BTreeSetUnionIter_new(&iter, this, other);
+
+    return iter;
+}
+
+// [BTreeSetIntersectionIter]
+
+typedef enum
+{
+    BTREE_SET_INTERSECTION_ITER_SIDE_A,
+    BTREE_SET_INTERSECTION_ITER_SIDE_B,
+} BTreeSetIntersectionIterSide;
+
+typedef struct
+{
+    const BTreeSet *a;
+    const BTreeSet *b;
+    BTreeMapEntryPos current;
+    bool is_done;
+} BTreeSetIntersectionIter;
+
+void BTreeSetIntersectionIter_new(BTreeSetIntersectionIter *this, const BTreeSet *a, const BTreeSet *b)
+{
+    this->a = a;
+    this->b = b;
+
+    if (BTreeSet_len(this->a) == 0 || BTreeSet_len(this->b) == 0)
+    {
+        this->is_done = true;
+    }
+    else
+    {
+        this->is_done = false;
+        this->current = BTreeMapEntryPos_new(_BTreeMap_leftmost(this->a->map), 0);
+    }
+}
+
+void *BTreeSetIntersectionIter_next(BTreeSetIntersectionIter *this)
+{
+    if (this->is_done)
+    {
+        return NULL;
+    }
+
+    BTreeSetIntersectionIterSide current_side = BTREE_SET_INTERSECTION_ITER_SIDE_A;
+    BTreeMapEntryPos current = this->current;
+    const BTreeSet *current_set = this->a;
+    const BTreeSet *other_set = this->b;
+
+    while (current.node != NULL)
+    {
+        BTreeMapEntry current_entry = BTreeMapEntryPos_to_entry(current, current_set->map);
+        _BTreeMapFindResult result = _BTreeMap_find((BTreeMap *)other_set->map, current_entry.key);
+
+        if (result.kind == GET_RESULT_KIND_FOUND)
+        {
+            current = current_side == BTREE_SET_INTERSECTION_ITER_SIDE_A ? current : result.found;
+            break;
+        }
+        else
+        {
+            if (result.go_down.kv_idx < result.go_down.node->key_count)
+            {
+                current = result.go_down;
+            }
+            else
+            {
+                current = _BTreeMap_next_inorder(this->a->map, &this->current);
+            }
+
+            if (current_side == BTREE_SET_INTERSECTION_ITER_SIDE_A)
+            {
+                current_side = BTREE_SET_INTERSECTION_ITER_SIDE_B;
+                current_set = this->b;
+                other_set = this->a;
+            }
+            else
+            {
+                current_side = BTREE_SET_INTERSECTION_ITER_SIDE_A;
+                current_set = this->a;
+                other_set = this->b;
+            }
+        }
+    }
+
+    if (current.node == NULL)
+    {
+        this->is_done = true;
+        return NULL;
+    }
+    else
+    {
+        this->current = _BTreeMap_next_inorder(this->a->map, &current);
+        BTreeMapEntry current_entry = BTreeMapEntryPos_to_entry(current, this->a->map);
+        return current_entry.key;
+    }
+}
+
+void BTreeSetIntersectionIter_drop(BTreeSetIntersectionIter *this)
+{
+}
+
+BTreeSetIntersectionIter BTreeSet_intersection(const BTreeSet *this, const BTreeSet *other)
+{
+    BTreeSetIntersectionIter iter;
+    BTreeSetIntersectionIter_new(&iter, this, other);
+
+    return iter;
+}
+
+// [BTreeSetDifferenceIter]
+
+typedef struct
+{
+    const BTreeSet *a;
+    const BTreeSet *b;
+    BTreeMapEntryPos current;
+    bool is_done;
+} BTreeSetDifferenceIter;
+
+void BTreeSetDifferenceIter_new(BTreeSetDifferenceIter *this, const BTreeSet *a, const BTreeSet *b)
+{
+    this->a = a;
+    this->b = b;
+
+    if (BTreeSet_len(this->a) == 0)
+    {
+        this->is_done = true;
+    }
+    else
+    {
+        this->current = BTreeMapEntryPos_new(_BTreeMap_leftmost(this->a->map), 0);
+        this->is_done = false;
+    }
+}
+
+void *BTreeSetDifferenceIter_next(BTreeSetDifferenceIter *this)
+{
+    if (this->is_done)
+    {
+        return NULL;
+    }
+
+    BTreeMapEntryPos current = this->current;
+    BTreeMapEntry current_entry = {};
+
+    while (current.node != NULL)
+    {
+        current_entry = BTreeMapEntryPos_to_entry(current, this->a->map);
+        _BTreeMapFindResult result = _BTreeMap_find(this->b->map, current_entry.key);
+
+        if (result.kind != GET_RESULT_KIND_FOUND)
+        {
+            break;
+        }
+
+        current = _BTreeMap_next_inorder(this->a->map, &current);
+    }
+
+    if (current.node == NULL)
+    {
+        this->is_done = true;
+        return NULL;
+    }
+    else
+    {
+        this->current = _BTreeMap_next_inorder(this->a->map, &current);
+        return current_entry.key;
+    }
+}
+
+void BTreeSetDifferenceIter_drop(BTreeSetDifferenceIter *this)
+{
+}
+
+BTreeSetDifferenceIter BTreeSet_difference(const BTreeSet *this, const BTreeSet *other)
+{
+    BTreeSetDifferenceIter iter;
+    BTreeSetDifferenceIter_new(&iter, this, other);
+
+    return iter;
+}
+
+// [BTreeSetSymmetricDifferenceIter]
+
+typedef enum
+{
+    BTREE_SET_SYMMETRIC_DIFFERENCE_ITER_SIDE_A,
+    BTREE_SET_SYMMETRIC_DIFFERENCE_ITER_SIDE_B,
+} BTreeSetSymmetricDifferenceIterSide;
+
+typedef struct
+{
+    const BTreeSet *a;
+    const BTreeSet *b;
+    BTreeMapEntryPos current_a;
+    bool a_is_done;
+    BTreeMapEntryPos current_b;
+    bool b_is_done;
+} BTreeSetSymmetricDifferenceIter;
+
+void BTreeSetSymmetricDifferenceIter_new(BTreeSetSymmetricDifferenceIter *this, const BTreeSet *a, const BTreeSet *b)
+{
+    this->a = a;
+    this->b = b;
+
+    if (BTreeSet_len(this->a) == 0)
+    {
+        this->a_is_done = true;
+    }
+    else
+    {
+        this->current_a = BTreeMapEntryPos_new(_BTreeMap_leftmost(this->a->map), 0);
+        this->a_is_done = false;
+    }
+
+    if (BTreeSet_len(this->b) == 0)
+    {
+        this->a_is_done = true;
+    }
+    else
+    {
+        this->current_b = BTreeMapEntryPos_new(_BTreeMap_leftmost(this->b->map), 0);
+        this->b_is_done = false;
+    }
+}
+
+void *BTreeSetSymmetricDifferenceIter_next(BTreeSetSymmetricDifferenceIter *this)
+{
+    if (this->a_is_done && this->b_is_done)
+    {
+        return NULL;
+    }
+
+    BTreeSetSymmetricDifferenceIterSide should_advance;
+
+    while (true)
+    {
+        if (this->a_is_done)
+        {
+            should_advance = BTREE_SET_UNION_ITER_SIDE_B;
+        }
+        else if (this->b_is_done)
+        {
+            should_advance = BTREE_SET_UNION_ITER_SIDE_A;
+        }
+        else
+        {
+            BTreeMapEntry current_a = BTreeMapEntryPos_to_entry(this->current_a, this->a->map);
+            BTreeMapEntry current_b = BTreeMapEntryPos_to_entry(this->current_b, this->b->map);
+
+            int_fast8_t result = this->a->map->key_props.cmp(current_a.key, current_b.key);
+
+            if (result == 0)
+            {
+                this->current_a = _BTreeMap_next_inorder(this->a->map, &this->current_a);
+                this->a_is_done = this->current_a.node == NULL;
+
+                this->current_b = _BTreeMap_next_inorder(this->b->map, &this->current_b);
+                this->b_is_done = this->current_b.node == NULL;
+
+                continue;
+            }
+            else
+            {
+                should_advance = result > 0 ? BTREE_SET_UNION_ITER_SIDE_B : BTREE_SET_UNION_ITER_SIDE_A;
+            }
+        }
+
+        break;
+    }
+
+    BTreeMapEntry current;
+
+    if (should_advance == BTREE_SET_SYMMETRIC_DIFFERENCE_ITER_SIDE_A)
+    {
+        current = BTreeMapEntryPos_to_entry(this->current_a, this->a->map);
+        this->current_a = _BTreeMap_next_inorder(this->a->map, &this->current_a);
+        this->a_is_done = this->current_a.node == NULL ? true : false;
+    }
+    else
+    {
+        current = BTreeMapEntryPos_to_entry(this->current_b, this->b->map);
+        this->current_b = _BTreeMap_next_inorder(this->b->map, &this->current_b);
+        this->b_is_done = this->current_b.node == NULL ? true : false;
+    }
+
+    return current.key;
+}
+
+void BTreeSetSymmetricDifferenceIter_drop(BTreeSetSymmetricDifferenceIter *this)
+{
+}
+
+BTreeSetSymmetricDifferenceIter BTreeSet_symmetric_difference(const BTreeSet *this, const BTreeSet *other)
+{
+    BTreeSetSymmetricDifferenceIter iter;
+    BTreeSetSymmetricDifferenceIter_new(&iter, this, other);
 
     return iter;
 }
@@ -2010,6 +2523,11 @@ void HashMap_insert(HashMap *this, void *key, void *value)
 
         if (this->key_props.eq(_HashMapEntry_key(entry), _HashMapEntry_key(current_entry)))
         {
+            if (this->key_props.drop != NULL)
+            {
+                this->key_props.drop(_HashMapEntry_key(current_entry));
+            }
+
             if (this->value_props.drop != NULL)
             {
                 this->value_props.drop(_HashMapEntry_value(current_entry, this));
@@ -3221,6 +3739,185 @@ int main(int argc, const char **argv)
         assert(expected == 4); // iterated 2,3 only
 
         BTreeMap_drop(&u8u8map);
+    }
+
+    {
+        BTreeSet set;
+        BTreeSetElementProps props = {
+            .size = sizeof(uint8_t),
+            .cmp = (CmpFn)compare_u8,
+            .drop = NULL,
+        };
+        BTreeSet_new(&set, &props);
+
+        for (uint8_t i = 1; i <= 3; i++)
+        {
+            BTreeSet_insert(&set, &i);
+        }
+
+        for (uint8_t i = 1; i <= 3; i++)
+        {
+            assert(BTreeSet_contains(&set, &i));
+        }
+
+        assert(BTreeSet_len(&set) == 3);
+
+        uint8_t val = 2;
+        BTreeSet_remove(&set, &val);
+        assert(!BTreeSet_contains(&set, &val));
+        assert(BTreeSet_len(&set) == 2);
+
+        BTreeSet_insert(&set, &val);
+        assert(BTreeSet_contains(&set, &val));
+        assert(BTreeSet_len(&set) == 3);
+
+        uint8_t nonexistent = 99;
+        BTreeSet_remove(&set, &nonexistent);
+        assert(BTreeSet_len(&set) == 3);
+
+        BTreeSet_drop(&set);
+
+        // BTreeSet_range
+
+        BTreeSet_new(&set, &props);
+
+        for (uint8_t i = 1; i <= 5; i++)
+            BTreeSet_insert(&set, &i);
+
+        uint8_t start = 2;
+        uint8_t end = 4;
+        RangeBound lower = RangeBound_included(&start);
+        RangeBound upper = RangeBound_included(&end);
+
+        BTreeSetRangeIter iter = BTreeSet_range(&set, &lower, &upper);
+
+        uint8_t expected = 2;
+        for (void *key = BTreeSetRangeIter_next(&iter); key != NULL; key = BTreeSetRangeIter_next(&iter))
+        {
+            assert(*(uint8_t *)key == expected);
+            expected++;
+        }
+        assert(expected == 5);
+
+        BTreeSetRangeIter_drop(&iter);
+        iter = BTreeSet_range(&set, &lower, &upper);
+
+        expected = 4;
+        for (void *key = BTreeSetRangeIter_next_back(&iter); key != NULL; key = BTreeSetRangeIter_next_back(&iter))
+        {
+            assert(*(uint8_t *)key == expected);
+            expected--;
+        }
+        assert(expected == 1);
+
+        BTreeSetRangeIter_drop(&iter);
+        BTreeSet_drop(&set);
+
+        // BTreeSet_union
+
+        BTreeSet a;
+        BTreeSet b;
+        BTreeSet_new(&a, &props);
+        BTreeSet_new(&b, &props);
+
+        for (uint8_t i = 1; i <= 3; i++)
+            BTreeSet_insert(&a, &i);
+
+        for (uint8_t i = 3; i <= 5; i++)
+            BTreeSet_insert(&b, &i);
+
+        BTreeSetUnionIter union_iter = BTreeSet_union(&a, &b);
+
+        uint8_t expected_union[] = {1, 2, 3, 4, 5};
+        size_t idx = 0;
+
+        for (void *key = BTreeSetUnionIter_next(&union_iter); key != NULL; key = BTreeSetUnionIter_next(&union_iter))
+        {
+            assert(*(uint8_t *)(key) == expected_union[idx]);
+            idx++;
+        }
+
+        assert(idx == 5);
+        BTreeSetUnionIter_drop(&union_iter);
+        BTreeSet_drop(&a);
+        BTreeSet_drop(&b);
+
+        // BTreeSet_intersection
+
+        BTreeSet_new(&a, &props);
+        BTreeSet_new(&b, &props);
+
+        for (uint8_t i = 1; i <= 3; i++)
+            BTreeSet_insert(&a, &i);
+        for (uint8_t i = 3; i <= 5; i++)
+            BTreeSet_insert(&b, &i);
+
+        BTreeSetIntersectionIter intersection_iter = BTreeSet_intersection(&a, &b);
+        uint8_t expected_intersection[] = {3};
+        idx = 0;
+
+        for (void *key = BTreeSetIntersectionIter_next(&intersection_iter); key != NULL; key = BTreeSetIntersectionIter_next(&intersection_iter))
+        {
+            assert(*(uint8_t *)key == expected_intersection[idx]);
+            idx++;
+        }
+
+        assert(idx == 1);
+        BTreeSetIntersectionIter_drop(&intersection_iter);
+        BTreeSet_drop(&a);
+        BTreeSet_drop(&b);
+
+        // BTreeSet_difference
+
+        BTreeSet_new(&a, &props);
+        BTreeSet_new(&b, &props);
+
+        for (uint8_t i = 1; i <= 3; i++)
+            BTreeSet_insert(&a, &i);
+        for (uint8_t i = 3; i <= 5; i++)
+            BTreeSet_insert(&b, &i);
+
+        BTreeSetDifferenceIter difference_iter = BTreeSet_difference(&a, &b);
+        uint8_t expected_difference[] = {1, 2};
+        idx = 0;
+
+        for (void *key = BTreeSetDifferenceIter_next(&difference_iter); key != NULL; key = BTreeSetDifferenceIter_next(&difference_iter))
+        {
+            assert(*(uint8_t *)key == expected_difference[idx]);
+            idx++;
+        }
+
+        assert(idx == 2);
+        BTreeSetDifferenceIter_drop(&difference_iter);
+        BTreeSet_drop(&a);
+        BTreeSet_drop(&b);
+
+        // BTreeSet_symmetric_difference
+
+        BTreeSet_new(&a, &props);
+        BTreeSet_new(&b, &props);
+
+        for (uint8_t i = 1; i <= 3; i++)
+            BTreeSet_insert(&a, &i);
+        for (uint8_t i = 3; i <= 5; i++)
+            BTreeSet_insert(&b, &i);
+
+        BTreeSetSymmetricDifferenceIter symmetric_difference_iter = BTreeSet_symmetric_difference(&a, &b);
+        uint8_t expected_symmetric_difference[] = {1, 2, 4, 5};
+        idx = 0;
+
+        for (void *key = BTreeSetSymmetricDifferenceIter_next(&symmetric_difference_iter);
+             key != NULL;
+             key = BTreeSetSymmetricDifferenceIter_next(&symmetric_difference_iter))
+        {
+            assert(*(uint8_t *)key == expected_symmetric_difference[idx]);
+            idx++;
+        }
+
+        assert(idx == 4);
+        BTreeSetSymmetricDifferenceIter_drop(&symmetric_difference_iter);
+        BTreeSet_drop(&a);
+        BTreeSet_drop(&b);
     }
 
     {
