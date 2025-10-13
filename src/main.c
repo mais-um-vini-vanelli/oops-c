@@ -8,6 +8,8 @@
 #define ROUND_SIZE_UP_TO_ALIGN(size, align) (((size + align - 1) / align) * align)
 #define ROUND_SIZE_UP_TO_MAX_ALIGN(size) ROUND_SIZE_UP_TO_ALIGN(size, _Alignof(max_align_t))
 
+#define MIN(a, b) (a < b ? a : b)
+
 typedef void (*DropFn)(void *this);
 typedef int_fast8_t (*CmpFn)(const void *a, const void *b);
 typedef bool (*EqFn)(const void *a, const void *b);
@@ -86,35 +88,402 @@ void MaybeOwned_drop(MaybeOwned *this)
     }
 }
 
-// [Iter]
+// [Iterator]
 
-typedef void *(*IterNextFn)(void *this);
+typedef void *(*IteratorNextFn)(void *this);
+typedef void *(*IteratorNextBackFn)(void *this);
+typedef size_t (*IteratorLenFn)(const void *this);
+
+typedef enum
+{
+    ITERATOR_CAPABILITY_ITERATOR = 1,
+    ITERATOR_CAPABILITY_DOUBLE_ENDED_ITERATOR = 1 << 1,
+    ITERATOR_CAPABILITY_EXACT_SIZE_ITERATOR = 1 << 2,
+} IteratorCapability;
 
 typedef struct
 {
-    IterNextFn next;
-} IterProps;
+    IteratorNextFn next;
+    IteratorNextBackFn next_back;
+    IteratorLenFn len;
+} IteratorProps;
 
 typedef struct
 {
     MaybeOwned concrete;
-    IterProps props;
-} Iter;
+    IteratorCapability capabilities;
+    IteratorProps props;
+} Iterator;
 
-void Iter_new(Iter *this, const IterProps *props, const MaybeOwned *concrete)
+void Iterator_new(Iterator *this, const IteratorProps *props, MaybeOwned concrete)
 {
     this->props = *props;
-    this->concrete = *concrete;
+    this->concrete = concrete;
+
+    this->capabilities = ITERATOR_CAPABILITY_ITERATOR;
+    this->capabilities |= this->props.next_back != NULL ? ITERATOR_CAPABILITY_DOUBLE_ENDED_ITERATOR : 0;
+    this->capabilities |= this->props.next_back != NULL ? ITERATOR_CAPABILITY_EXACT_SIZE_ITERATOR : 0;
 }
 
-void *Iter_next(Iter *this)
+void *Iterator_next(Iterator *this)
 {
+    assert(this->capabilities & ITERATOR_CAPABILITY_ITERATOR);
+
     return this->props.next(MaybeOwned_value(&this->concrete));
 }
 
-void Iter_drop(Iter *this)
+static void _Iterator_advance_by(Iterator *this, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        if (Iterator_next(this) == NULL)
+        {
+            break;
+        }
+    }
+}
+
+void *Iterator_nth(Iterator *this, size_t n)
+{
+    assert(this->capabilities & ITERATOR_CAPABILITY_ITERATOR);
+
+    _Iterator_advance_by(this, n);
+    return Iterator_next(this);
+}
+
+void *Iterator_next_back(Iterator *this)
+{
+    assert(this->capabilities & ITERATOR_CAPABILITY_DOUBLE_ENDED_ITERATOR);
+
+    return this->props.next_back(MaybeOwned_value(&this->concrete));
+}
+
+static void _Iterator_advance_back_by(Iterator *this, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        if (Iterator_next_back(this) == NULL)
+        {
+            break;
+        }
+    }
+}
+
+void *Iterator_nth_back(Iterator *this, size_t n)
+{
+    assert(this->capabilities & ITERATOR_CAPABILITY_DOUBLE_ENDED_ITERATOR);
+
+    _Iterator_advance_back_by(this, n);
+    return Iterator_next_back(this);
+}
+
+size_t Iterator_len(const Iterator *this)
+{
+    assert(this->capabilities & ITERATOR_CAPABILITY_EXACT_SIZE_ITERATOR);
+
+    return this->props.len(MaybeOwned_value(&this->concrete));
+}
+
+bool Iterator_is_empty(const Iterator *this)
+{
+    assert(this->capabilities & ITERATOR_CAPABILITY_EXACT_SIZE_ITERATOR);
+
+    return Iterator_len(this) == 0;
+}
+
+void Iterator_drop(Iterator *this)
 {
     MaybeOwned_drop(&this->concrete);
+}
+
+// [SkipIter]
+
+typedef struct
+{
+    Iterator concrete;
+    size_t n;
+} SkipIter;
+
+void SkipIter_new(SkipIter *this, Iterator *concrete, size_t n)
+{
+    this->concrete = *concrete;
+    this->n = n;
+}
+
+void *SkipIter_next(SkipIter *this)
+{
+    if (this->n != 0)
+    {
+        size_t n = this->n;
+        this->n = 0;
+        return Iterator_nth(&this->concrete, n);
+    }
+    else
+    {
+        return Iterator_next(&this->concrete);
+    }
+}
+
+size_t SkipIter_len(const SkipIter *this)
+{
+    size_t len = Iterator_len(&this->concrete);
+
+    if (this->n > len)
+    {
+        return 0;
+    }
+    else
+    {
+        return len - this->n;
+    }
+}
+
+void *SkipIter_next_back(SkipIter *this)
+{
+    return SkipIter_len(this) == 0 ? NULL : Iterator_next_back(&this->concrete);
+}
+
+Iterator SkipIter_iter(SkipIter *this)
+{
+    Iterator iter;
+    IteratorProps props = {
+        .next = (IteratorNextFn)SkipIter_next,
+        .next_back = (IteratorNextBackFn)SkipIter_next_back,
+        .len = (IteratorLenFn)SkipIter_len,
+    };
+    Iterator_new(&iter, &props, MaybeOwned_borrowed(this));
+
+    return iter;
+}
+
+void SkipIter_drop(SkipIter *this)
+{
+    Iterator_drop(&this->concrete);
+}
+
+SkipIter Iterator_skip(Iterator *this, size_t n)
+{
+    SkipIter iter;
+    SkipIter_new(&iter, this, n);
+
+    return iter;
+}
+
+// [TakeIter]
+
+typedef struct
+{
+    Iterator concrete;
+    size_t n;
+} TakeIter;
+
+void TakeIter_new(TakeIter *this, Iterator *concrete, size_t n)
+{
+    this->concrete = *concrete;
+    this->n = n;
+}
+
+void *TakeIter_next(TakeIter *this)
+{
+    if (this->n == 0)
+    {
+        return NULL;
+    }
+    else
+    {
+        this->n -= 1;
+
+        return Iterator_next(&this->concrete);
+    }
+}
+
+void *TakeIter_next_back(TakeIter *this)
+{
+    size_t len = Iterator_len(&this->concrete);
+
+    if (this->n > len)
+    {
+        return Iterator_nth_back(&this->concrete, 0);
+    }
+    else
+    {
+        this->n -= 1;
+        return Iterator_nth_back(&this->concrete, len - this->n);
+    }
+}
+
+size_t TakeIter_len(const TakeIter *this)
+{
+    size_t len = Iterator_len(&this->concrete);
+    return MIN(len, this->n);
+}
+
+Iterator TakeIter_iter(TakeIter *this)
+{
+    Iterator iter;
+    IteratorProps props = {
+        .next = (IteratorNextFn)TakeIter_next,
+        .next_back = (IteratorNextBackFn)TakeIter_next_back,
+        .len = (IteratorLenFn)TakeIter_len,
+    };
+    Iterator_new(&iter, &props, MaybeOwned_borrowed(this));
+
+    return iter;
+}
+
+void TakeIter_drop(TakeIter *this)
+{
+    Iterator_drop(&this->concrete);
+}
+
+TakeIter Iterator_take(Iterator *this, size_t n)
+{
+    TakeIter iter;
+    TakeIter_new(&iter, this, n);
+
+    return iter;
+}
+
+// [StepByIter]
+
+typedef struct
+{
+    Iterator concrete;
+    size_t step;
+    bool first_take;
+} StepByIter;
+
+void StepByIter_new(StepByIter *this, Iterator *concrete, size_t step)
+{
+    this->concrete = *concrete;
+    this->step = step;
+    this->first_take = true;
+}
+
+void *StepByIter_next(StepByIter *this)
+{
+    size_t n = this->first_take ? 0 : this->step - 1;
+    this->first_take = false;
+    return Iterator_nth(&this->concrete, n);
+}
+
+static size_t _StepByIter_next_back_nth(const StepByIter *this)
+{
+    size_t len = Iterator_len(&this->concrete);
+    size_t last_idx = this->first_take ? len - 1 : len;
+    return last_idx % this->step;
+}
+
+void *StepByIter_next_back(StepByIter *this)
+{
+    size_t len = Iterator_len(&this->concrete);
+
+    if (len == 0)
+    {
+        return NULL;
+    }
+    else
+    {
+        return Iterator_nth_back(&this->concrete, _StepByIter_next_back_nth(this));
+    }
+}
+
+size_t StepByIter_len(const StepByIter *this)
+{
+    size_t len = Iterator_len(&this->concrete);
+
+    if (len == 0)
+    {
+        return 0;
+    }
+
+    if (this->first_take)
+    {
+        return 1 + (len - 1) / this->step;
+    }
+    else
+    {
+        return len / this->step;
+    }
+}
+
+Iterator StepByIter_iter(StepByIter *this)
+{
+    Iterator iter;
+    IteratorProps props = {
+        .next = (IteratorNextFn)StepByIter_next,
+        .next_back = (IteratorNextBackFn)StepByIter_next_back,
+        .len = (IteratorLenFn)StepByIter_len,
+    };
+    Iterator_new(&iter, &props, MaybeOwned_borrowed(this));
+
+    return iter;
+}
+
+void StepByIter_drop(StepByIter *this)
+{
+    Iterator_drop(&this->concrete);
+}
+
+StepByIter Iterator_step_by(Iterator *this, size_t n)
+{
+    StepByIter iter;
+    StepByIter_new(&iter, this, n);
+
+    return iter;
+}
+
+// [RevIter]
+
+typedef struct
+{
+    Iterator concrete;
+} RevIter;
+
+void RevIter_new(RevIter *this, Iterator *concrete)
+{
+    this->concrete = *concrete;
+}
+
+void *RevIter_next(RevIter *this)
+{
+    return Iterator_next_back(&this->concrete);
+}
+
+void *RevIter_next_back(RevIter *this)
+{
+    return Iterator_next(&this->concrete);
+}
+
+size_t RevIter_len(const RevIter *this)
+{
+    return Iterator_len(&this->concrete);
+}
+
+Iterator RevIter_iter(RevIter *this)
+{
+    Iterator iter;
+    IteratorProps props = {
+        .next = (IteratorNextFn)RevIter_next,
+        .next_back = (IteratorNextBackFn)RevIter_next_back,
+        .len = (IteratorLenFn)RevIter_len,
+    };
+    Iterator_new(&iter, &props, MaybeOwned_borrowed(this));
+
+    return iter;
+}
+
+void RevIter_drop(RevIter *this)
+{
+    Iterator_drop(&this->concrete);
+}
+
+RevIter Iterator_rev(Iterator *this)
+{
+    RevIter iter;
+    RevIter_new(&iter, this);
+
+    return iter;
 }
 
 // [Vec]
@@ -319,6 +688,90 @@ void Vec_drop(Vec *this)
 
     free(this->data);
     this->data = NULL;
+}
+
+// [VecIter]
+
+typedef struct
+{
+    const Vec *vec;
+    size_t start;
+    size_t end;
+    bool is_done;
+} VecIter;
+
+void VecIter_new(VecIter *this, const Vec *vec)
+{
+    this->vec = vec;
+
+    if (Vec_len(vec) == 0)
+    {
+        this->is_done = true;
+    }
+    else
+    {
+        this->is_done = false;
+        this->start = 0;
+        this->end = Vec_len(vec) - 1;
+    }
+}
+
+const void *VecIter_next(VecIter *this)
+{
+    if (this->is_done)
+    {
+        return NULL;
+    }
+
+    this->is_done = this->start == this->end;
+
+    const void *element = Vec_get(this->vec, this->start);
+    this->start += 1;
+    return element;
+}
+
+const void *VecIter_next_back(VecIter *this)
+{
+    if (this->is_done)
+    {
+        return NULL;
+    }
+
+    this->is_done = this->start == this->end;
+
+    const void *element = Vec_get(this->vec, this->end);
+    this->end -= 1;
+    return element;
+}
+
+size_t VecIter_len(const VecIter *this)
+{
+    return this->end - this->start + 1;
+}
+
+void VecIter_drop(VecIter *this)
+{
+}
+
+VecIter Vec_iter(const Vec *this)
+{
+    VecIter iter;
+    VecIter_new(&iter, this);
+
+    return iter;
+}
+
+Iterator VecIter_iter(VecIter *this)
+{
+    Iterator iter;
+    IteratorProps props = {
+        .next = (IteratorNextFn)VecIter_next,
+        .next_back = (IteratorNextBackFn)VecIter_next_back,
+        .len = (IteratorLenFn)VecIter_len,
+    };
+    Iterator_new(&iter, &props, MaybeOwned_borrowed(this));
+
+    return iter;
 }
 
 // [RangeBound]
@@ -1957,8 +2410,6 @@ void LinkedList_drop(LinkedList *this)
 }
 
 // [VecDeque]
-
-#define MIN(a, b) (a < b ? a : b)
 
 typedef struct
 {
@@ -4358,6 +4809,171 @@ int main(int argc, const char **argv)
             SplitIterator_drop(&split);
             String_drop(&s);
         }
+    }
+
+    {
+        Vec v;
+        VecElementOps ops = {};
+        Vec_new(&v, sizeof(size_t), &ops);
+
+        for (size_t i = 1; i <= 5; i++)
+        {
+            Vec_push(&v, &i);
+        }
+
+        {
+            VecIter it = Vec_iter(&v);
+            Iterator _it = VecIter_iter(&it);
+
+            assert(Iterator_len(&_it) == 5);
+
+            size_t i = 1;
+
+            for (const void *elem = Iterator_next(&_it); elem != NULL; elem = Iterator_next(&_it))
+            {
+                assert(*(size_t *)elem == i);
+
+                i++;
+            }
+
+            assert(i == 6);
+        }
+
+        // SkipIter
+        {
+            VecIter it = Vec_iter(&v);
+            Iterator _it = VecIter_iter(&it);
+            SkipIter it2 = Iterator_skip(&_it, 2);
+            Iterator __it = SkipIter_iter(&it2);
+
+            assert(Iterator_len(&__it) == 3);
+
+            size_t i = 3;
+
+            for (const void *elem = Iterator_next(&__it); elem != NULL; elem = Iterator_next(&__it))
+            {
+                assert(*(size_t *)elem == i);
+                i++;
+            }
+
+            assert(i == 6);
+        }
+
+        // TakeIter
+        {
+            VecIter it = Vec_iter(&v);
+            Iterator _it = VecIter_iter(&it);
+            TakeIter it2 = Iterator_take(&_it, 3);
+            Iterator __it = TakeIter_iter(&it2);
+
+            assert(Iterator_len(&__it) == 3);
+
+            size_t i = 1;
+
+            for (const void *elem = Iterator_next(&__it); elem != NULL; elem = Iterator_next(&__it))
+            {
+                assert(*(size_t *)elem == i);
+                i++;
+            }
+
+            assert(i == 4);
+        }
+
+        // RevIter
+        {
+            VecIter it = Vec_iter(&v);
+            Iterator _it = VecIter_iter(&it);
+            RevIter it2 = Iterator_rev(&_it);
+            Iterator __it = RevIter_iter(&it2);
+
+            assert(Iterator_len(&__it) == 5);
+
+            size_t i = 5;
+
+            for (const void *elem = Iterator_next(&__it); elem != NULL; elem = Iterator_next(&__it))
+            {
+                assert(*(size_t *)elem == i);
+                i--;
+            }
+
+            assert(i == 0);
+        }
+
+        // StepByIter
+        {
+            size_t new = 6;
+            Vec_push(&v, &new);
+
+            VecIter it = Vec_iter(&v);
+            Iterator _it = VecIter_iter(&it);
+            StepByIter it2 = Iterator_step_by(&_it, 2);
+            Iterator __it = StepByIter_iter(&it2);
+
+            assert(Iterator_len(&__it) == 3);
+
+            size_t expected_step[] = {1, 3, 5};
+            size_t i = 0;
+
+            for (const void *elem = Iterator_next(&__it); elem != NULL; elem = Iterator_next(&__it))
+            {
+                assert(*(size_t *)elem == expected_step[i]);
+                i++;
+            }
+
+            assert(i == 3);
+        }
+
+        // StepByIter + Rev
+        {
+            VecIter it = Vec_iter(&v);
+            Iterator _it = VecIter_iter(&it);
+            StepByIter it2 = Iterator_step_by(&_it, 2);
+            Iterator __it = StepByIter_iter(&it2);
+            RevIter it3 = Iterator_rev(&__it);
+            Iterator ___it = RevIter_iter(&it3);
+
+            assert(Iterator_len(&___it) == 3);
+
+            size_t expected_step[] = {5, 3, 1};
+            size_t i = 0;
+
+            for (const void *elem = Iterator_next(&___it); elem != NULL; elem = Iterator_next(&___it))
+            {
+                assert(*(size_t *)elem == expected_step[i]);
+                i++;
+            }
+
+            assert(i == 3);
+        }
+
+        Vec_drop(&v);
+
+        /*
+        TODO: builder for composition
+
+        typedef enum {
+            ITER_KIND_SKIP,
+            ITER_KIND_TAKE,
+            ITER_KIND_STEP_BY,
+            ITER_KIND_REV,
+        } IterKind;
+
+        typedef struct {
+            IterKind kind;
+            union {
+                struct { size_t n; } Skip;
+                struct { size_t n; } Take;
+                struct { size_t step; } StepBy;
+            };
+        } IterSpec;
+
+        typedef struct {
+            Iterator it;
+            void *heap_block;
+        } IteratorBuilderResult;
+
+        IteratorBuilderResult Iterator_build(Iterator base, const IterSpec *specs, size_t count);
+        */
     }
 
     return 0;
