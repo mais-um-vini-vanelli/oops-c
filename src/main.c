@@ -10,10 +10,16 @@
 
 #define MIN(a, b) (a < b ? a : b)
 #define SIZE(a) (sizeof(a) / sizeof(a[0]))
-#define EACH_IN(e, iter)            \
-    void *e = Iterator_next(&iter); \
-    e != NULL;                      \
-    e = Iterator_next(&iter)
+
+#define ITERATOR_NEXT(obj) _Generic((obj), \
+    VecIter *: VecIter_next,               \
+    AdapterIter *: AdapterIter_next,       \
+    Iterator *: Iterator_next)
+
+#define EACH_IN(e, iter)                           \
+    void *e = (void *)ITERATOR_NEXT(&iter)(&iter); \
+    e != NULL;                                     \
+    e = (void *)ITERATOR_NEXT(&iter)(&iter)
 
 typedef void (*DropFn)(void *this);
 typedef int_fast8_t (*CmpFn)(const void *a, const void *b);
@@ -418,6 +424,13 @@ void RevIter_drop(RevIter *this)
 }
 
 // [AdapterIter]
+
+#define ADAPTER_ITER_NEW(base, ...) AdapterIter_new( \
+    METHOD(&base, linked_iter)(&base),               \
+    (AdapterIterSpec[]){                             \
+        __VA_ARGS__,                                 \
+        AdapterIterSpec_none(),                      \
+    });
 
 typedef struct AdapterIterSpec AdapterIterSpec;
 
@@ -1029,6 +1042,8 @@ static void _swap(void *a, void *b, size_t size)
     memcpy(a, b, size);
     memcpy(b, tmp, size);
 }
+
+#define SWAP(a, b) _swap(&a, &b, sizeof(a))
 
 typedef struct __BTreeMapNode
 {
@@ -2718,7 +2733,11 @@ void VecDeque_pop_back(VecDeque *this)
 {
     if (this->length > 0)
     {
-        this->element_props.drop(VecDeque_back(this));
+        if (this->element_props.drop != NULL)
+        {
+            this->element_props.drop(VecDeque_back(this));
+        }
+
         this->length--;
     }
 }
@@ -4137,6 +4156,11 @@ size_t String_len(const String *this)
     return Vec_len(this->buffer);
 }
 
+uint8_t String_get(const String *this, size_t i)
+{
+    return *(uint8_t *)Vec_get(this->buffer, i);
+}
+
 size_t String_capacity(const String *this)
 {
     return Vec_capacity(this->buffer);
@@ -4163,7 +4187,592 @@ void String_drop(String *this)
     free(this->buffer);
 }
 
+// [Regex]
+
 #include <stdint.h>
+
+typedef enum
+{
+    TOKEN_KIND_LITERAL,
+    TOKEN_KIND_CONCATENATION,
+    TOKEN_KIND_ALTERNATION,
+    TOKEN_KIND_ZERO_OR_ONE,
+    TOKEN_KIND_ZERO_OR_MORE,
+    TOKEN_KIND_ONE_OR_MORE,
+    TOKEN_KIND_LEFT_PARENS,
+    TOKEN_KIND_RIGHT_PARENS,
+} TokenKind;
+
+typedef struct
+{
+    TokenKind kind;
+
+    union
+    {
+        struct
+        {
+            uint8_t c;
+        } literal;
+    };
+} Token;
+
+bool Regex_can_start_expr(const Token *token)
+{
+    switch (token->kind)
+    {
+    case TOKEN_KIND_LITERAL:
+    case TOKEN_KIND_LEFT_PARENS:
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+bool Regex_can_end_expr(const Token *token)
+{
+    switch (token->kind)
+    {
+    case TOKEN_KIND_LITERAL:
+    case TOKEN_KIND_RIGHT_PARENS:
+    case TOKEN_KIND_ZERO_OR_ONE:
+    case TOKEN_KIND_ZERO_OR_MORE:
+    case TOKEN_KIND_ONE_OR_MORE:
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+Vec Regex_tokenize(const String *regex)
+{
+    Vec tokens;
+    Vec_new(&tokens, sizeof(Token), &(VecElementOps){});
+
+    for (size_t i = 0; i < String_len(regex); i++)
+    {
+        switch (String_get(regex, i))
+        {
+        case '|':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ALTERNATION});
+            break;
+
+        case '?':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ZERO_OR_ONE});
+            break;
+
+        case '*':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ZERO_OR_MORE});
+            break;
+
+        case '+':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ONE_OR_MORE});
+            break;
+
+        case '(':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_LEFT_PARENS});
+            break;
+
+        case ')':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_RIGHT_PARENS});
+            break;
+
+        case '\\':
+        {
+            i += 1;
+
+            Vec_push(
+                &tokens,
+                &(Token){
+                    .kind = TOKEN_KIND_LITERAL,
+                    .literal = {
+                        .c = String_get(regex, i),
+                    },
+                });
+        }
+        break;
+
+        default:
+        {
+            Vec_push(
+                &tokens,
+                &(Token){
+                    .kind = TOKEN_KIND_LITERAL,
+                    .literal = {
+                        .c = String_get(regex, i),
+                    },
+                });
+        }
+        }
+    }
+
+    // insert concatenation markers
+
+    for (size_t i = 1; i < Vec_len(&tokens); i++)
+    {
+        if (Regex_can_end_expr(Vec_get(&tokens, i - 1)) && Regex_can_start_expr(Vec_get(&tokens, i)))
+        {
+            Vec_insert(&tokens, i, &(Token){.kind = TOKEN_KIND_CONCATENATION});
+            i += 1;
+        }
+    }
+
+    return tokens;
+}
+
+size_t Regex_get_oper_precedence(const Token *token)
+{
+    switch (token->kind)
+    {
+    case TOKEN_KIND_ZERO_OR_ONE:
+    case TOKEN_KIND_ZERO_OR_MORE:
+    case TOKEN_KIND_ONE_OR_MORE:
+        return 3;
+
+    case TOKEN_KIND_CONCATENATION:
+        return 2;
+
+    case TOKEN_KIND_ALTERNATION:
+        return 1;
+
+    default:
+        assert(false);
+        return 0;
+    }
+}
+
+Vec Regex_to_postfix(const Vec *tokens)
+{
+    VecDeque stack;
+    VecDeque_new(&stack, &(VecDequeElementProps){.size = sizeof(Token)});
+
+    Vec postfix;
+    Vec_new(&postfix, sizeof(Token), &(VecElementOps){});
+
+    for (size_t i = 0; i < Vec_len(tokens); i++)
+    {
+        const Token *token = Vec_get(tokens, i);
+
+        switch (token->kind)
+        {
+        case TOKEN_KIND_LITERAL:
+            Vec_push(&postfix, token);
+            break;
+
+        case TOKEN_KIND_LEFT_PARENS:
+            VecDeque_push_back(&stack, token);
+            break;
+
+        case TOKEN_KIND_RIGHT_PARENS:
+        {
+            const Token *back = VecDeque_back(&stack);
+
+            while (back->kind != TOKEN_KIND_LEFT_PARENS)
+            {
+                Vec_push(&postfix, back);
+
+                VecDeque_pop_back(&stack);
+            }
+
+            VecDeque_pop_back(&stack);
+        }
+        break;
+
+        default:
+        {
+            for (const Token *back = VecDeque_back(&stack); back != NULL; back = VecDeque_back(&stack))
+            {
+                if ((Regex_get_oper_precedence(back) < Regex_get_oper_precedence(token)))
+                {
+                    break;
+                }
+
+                Vec_push(&postfix, back);
+
+                VecDeque_pop_back(&stack);
+            }
+
+            VecDeque_push_back(&stack, token);
+        }
+        }
+    }
+
+    for (const Token *back = VecDeque_back(&stack); back != NULL; back = VecDeque_back(&stack))
+    {
+        Vec_push(&postfix, back);
+
+        VecDeque_pop_back(&stack);
+    }
+
+    VecDeque_drop(&stack);
+
+    return postfix;
+}
+
+typedef enum
+{
+    STATE_KIND_LITERAL,
+    STATE_KIND_SPLIT,
+    STATE_KIND_MATCH,
+} StateKind;
+
+typedef struct _State
+{
+    StateKind kind;
+
+    union
+    {
+        struct
+        {
+            uint8_t c;
+            struct _State *out;
+        } literal;
+
+        struct
+        {
+            struct _State *out1;
+            struct _State *out2;
+        } split;
+    };
+} State;
+
+typedef State **OutList;
+
+OutList OutList_new(State **out)
+{
+    *out = NULL;
+    return out;
+}
+
+OutList OutList_append(OutList this, OutList other)
+{
+    OutList current;
+    for (current = this; *current != NULL; current = (OutList)*current)
+        ;
+
+    *current = (State *)other;
+
+    return this;
+}
+
+void OutList_patch(OutList this, State *to)
+{
+    for (OutList current = this; current != NULL;)
+    {
+        OutList next = (OutList)*current;
+        *current = to;
+        current = next;
+    }
+}
+
+typedef struct
+{
+    State *start;
+    OutList out_list;
+} Fragment;
+
+typedef struct
+{
+    Vec states;
+    State *start;
+    size_t match_idx;
+} NFA;
+
+typedef struct
+{
+    NFA nfa;
+} Regex;
+
+NFA Regex_build_nfa(const Vec *tokens)
+{
+    Vec states;
+    Vec_with_capacity(&states, sizeof(State), &(VecElementOps){}, Vec_len(tokens) + 1);
+
+    VecDeque fragment_stack;
+    VecDeque_new(&fragment_stack, &(VecDequeElementProps){.size = sizeof(Fragment)});
+
+    for (size_t i = 0; i < Vec_len(tokens); i++)
+    {
+        const Token *token = Vec_get(tokens, i);
+
+        switch (token->kind)
+        {
+        case TOKEN_KIND_LITERAL:
+        {
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_LITERAL,
+                    .literal = {
+                        .c = token->literal.c,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = new,
+                    .out_list = OutList_new((State **)&new->literal.out),
+                });
+        }
+        break;
+
+        case TOKEN_KIND_CONCATENATION:
+        {
+            Fragment frag2 = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Fragment frag1 = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            OutList_patch(frag1.out_list, frag2.start);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = frag1.start,
+                    .out_list = frag2.out_list,
+                });
+        }
+        break;
+
+        case TOKEN_KIND_ALTERNATION:
+        {
+            Fragment frag2 = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Fragment frag1 = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_SPLIT,
+                    .split = {
+                        .out1 = frag1.start,
+                        .out2 = frag2.start,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = new,
+                    .out_list = OutList_append(frag1.out_list, frag2.out_list),
+                });
+        }
+        break;
+
+        case TOKEN_KIND_ZERO_OR_ONE:
+        {
+            Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_SPLIT,
+                    .split = {
+                        .out1 = frag.start,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = new,
+                    .out_list = OutList_append(frag.out_list, OutList_new(&new->split.out2)),
+                });
+        }
+        break;
+
+        case TOKEN_KIND_ZERO_OR_MORE:
+        {
+            Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_SPLIT,
+                    .split = {
+                        .out1 = frag.start,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            OutList_patch(frag.out_list, new);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = new,
+                    .out_list = OutList_new(&new->split.out2),
+                });
+        }
+        break;
+
+        case TOKEN_KIND_ONE_OR_MORE:
+        {
+            Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_SPLIT,
+                    .split = {
+                        .out1 = frag.start,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            OutList_patch(frag.out_list, new);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = frag.start,
+                    .out_list = OutList_new(&new->split.out2),
+                });
+        }
+        break;
+
+        default:
+            assert(false);
+        }
+    }
+
+    Vec_push(&states, &(State){.kind = STATE_KIND_MATCH});
+
+    size_t match_idx = Vec_len(&states) - 1;
+    State *new = Vec_get_mut(&states, match_idx);
+    Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
+    OutList_patch(frag.out_list, new);
+
+    return (NFA){
+        .states = states,
+        .start = frag.start,
+        .match_idx = match_idx,
+    };
+}
+
+Regex Regex_new(const String *regex)
+{
+    Vec tokens = Regex_tokenize(regex);
+    Vec postfix = Regex_to_postfix(&tokens);
+    Vec_drop(&tokens);
+
+    return (Regex){
+        .nfa = Regex_build_nfa(&postfix),
+    };
+}
+
+size_t Regex_state_idx(Regex *this, State *state)
+{
+    return ((uint8_t *)(state) - (uint8_t *)(Vec_get(&this->nfa.states, 0))) / sizeof(State);
+}
+
+void Regex_add_state(Regex *this, Vec *list, State *state)
+{
+    size_t i = Regex_state_idx(this, state);
+    bool *slot = (bool *)Vec_get_mut(list, i);
+
+    if (*slot == true)
+    {
+        return;
+    }
+
+    *slot = true;
+
+    if (state->kind == STATE_KIND_SPLIT)
+    {
+        Regex_add_state(this, list, state->split.out1);
+        Regex_add_state(this, list, state->split.out2);
+    }
+}
+
+void Regex_step(Regex *this, Vec *current_list, uint8_t c, Vec *next_list)
+{
+    memset(Vec_get_mut(next_list, 0), 0, Vec_len(next_list) * sizeof(bool));
+
+    for (size_t i = 0; i < Vec_len(current_list); i++)
+    {
+        if (*(bool *)Vec_get(current_list, i) == true)
+        {
+            State *state = (State *)Vec_get(&this->nfa.states, i);
+
+            if (state->kind == STATE_KIND_LITERAL && c == state->literal.c)
+            {
+                Regex_add_state(this, next_list, state->literal.out);
+            }
+        }
+    }
+}
+
+bool Regex_has_match(Regex *this, Vec *current_list)
+{
+    return *(bool *)Vec_get(current_list, this->nfa.match_idx) == true;
+}
+
+bool Regex_is_match(Regex *this, const String *str)
+{
+    Vec current_list;
+    Vec_with_capacity(&current_list, sizeof(bool), &(VecElementOps){}, Vec_len(&this->nfa.states));
+    Vec_set_len(&current_list, Vec_len(&this->nfa.states));
+
+    Vec next_list;
+    Vec_with_capacity(&next_list, sizeof(bool), &(VecElementOps){}, Vec_len(&this->nfa.states));
+    Vec_set_len(&next_list, Vec_len(&this->nfa.states));
+
+    memset(Vec_get_mut(&current_list, 0), 0, Vec_len(&current_list) * sizeof(bool));
+    Regex_add_state(this, &current_list, this->nfa.start);
+
+    for (size_t i = 0; i < String_len(str); i++)
+    {
+        uint8_t c = String_get(str, i);
+        Regex_step(this, &current_list, c, &next_list);
+
+        bool has_any = false;
+
+        for (size_t i = 0; i < Vec_len(&next_list); i++)
+        {
+            if (*(bool *)Vec_get(&next_list, i) == true)
+            {
+                has_any = true;
+                break;
+            }
+        }
+
+        if (!has_any)
+        {
+            break;
+        }
+
+        SWAP(current_list, next_list);
+    }
+
+    bool is_match = Regex_has_match(this, &current_list);
+
+    Vec_drop(&current_list);
+    Vec_drop(&next_list);
+
+    return is_match;
+}
+
+void Regex_drop(Regex *this)
+{
+    Vec_drop(&this->nfa.states);
+}
 
 bool eq_u8(const uint8_t *a, const uint8_t *b)
 {
@@ -4198,6 +4807,16 @@ void drop_nop(void *ptr)
 
 int main(int argc, const char **argv)
 {
+    String str;
+    String_from(&str, Str_from_cstr("a?b+c"));
+    Regex regex = Regex_new(&str);
+    String haystack;
+    String_from(&haystack, Str_from_cstr("bbbbc"));
+    assert(Regex_is_match(&regex, &haystack));
+    String_drop(&str);
+    String_drop(&haystack);
+    Regex_drop(&regex);
+
     {
         Vec u8vec;
         Vec_new(&u8vec, sizeof(uint8_t), NULL);
@@ -5010,18 +5629,19 @@ int main(int argc, const char **argv)
 
         {
             VecIter it = Vec_iter(&v);
-            Iterator _it = VecIter_iter(&it);
 
-            assert(Iterator_len(&_it) == 5);
+            assert(VecIter_len(&it) == 5);
 
             size_t i = 1;
 
-            for (EACH_IN(elem, _it))
+            for (EACH_IN(elem, it))
             {
                 assert(*(size_t *)elem == i);
 
                 i++;
             }
+
+            VecIter_drop(&it);
 
             assert(i == 6);
         }
@@ -5036,13 +5656,11 @@ int main(int argc, const char **argv)
                     AdapterIterSpec_none(),
                 });
 
-            Iterator __it = AdapterIter_iter(&_it);
-
-            assert(Iterator_len(&__it) == 3);
+            assert(AdapterIter_len(&_it) == 3);
 
             size_t i = 3;
 
-            for (EACH_IN(elem, __it))
+            for (EACH_IN(elem, _it))
             {
                 assert(*(size_t *)elem == i);
                 i++;
@@ -5062,17 +5680,18 @@ int main(int argc, const char **argv)
                     AdapterIterSpec_take(3),
                     AdapterIterSpec_none(),
                 });
-            Iterator __it = AdapterIter_iter(&_it);
 
-            assert(Iterator_len(&__it) == 3);
+            assert(AdapterIter_len(&_it) == 3);
 
             size_t i = 1;
 
-            for (EACH_IN(elem, __it))
+            for (EACH_IN(elem, _it))
             {
                 assert(*(size_t *)elem == i);
                 i++;
             }
+
+            AdapterIter_drop(&_it);
 
             assert(i == 4);
         }
@@ -5086,17 +5705,18 @@ int main(int argc, const char **argv)
                     AdapterIterSpec_rev(2),
                     AdapterIterSpec_none(),
                 });
-            Iterator __it = AdapterIter_iter(&_it);
 
-            assert(Iterator_len(&__it) == 5);
+            assert(AdapterIter_len(&_it) == 5);
 
             size_t i = 5;
 
-            for (EACH_IN(elem, __it))
+            for (EACH_IN(elem, _it))
             {
                 assert(*(size_t *)elem == i);
                 i--;
             }
+
+            AdapterIter_drop(&_it);
 
             assert(i == 0);
         }
@@ -5113,18 +5733,19 @@ int main(int argc, const char **argv)
                     AdapterIterSpec_step_by(2),
                     AdapterIterSpec_none(),
                 });
-            Iterator __it = AdapterIter_iter(&_it);
 
-            assert(Iterator_len(&__it) == 3);
+            assert(AdapterIter_len(&_it) == 3);
 
             size_t expected_step[] = {1, 3, 5};
             size_t i = 0;
 
-            for (EACH_IN(elem, __it))
+            for (EACH_IN(elem, _it))
             {
                 assert(*(size_t *)elem == expected_step[i]);
                 i++;
             }
+
+            AdapterIter_drop(&_it);
 
             assert(i == 3);
         }
@@ -5139,18 +5760,19 @@ int main(int argc, const char **argv)
                     AdapterIterSpec_rev(),
                     AdapterIterSpec_none(),
                 });
-            Iterator __it = AdapterIter_iter(&_it);
 
-            assert(Iterator_len(&__it) == 3);
+            assert(AdapterIter_len(&_it) == 3);
 
             size_t expected_step[] = {5, 3, 1};
             size_t i = 0;
 
-            for (EACH_IN(elem, __it))
+            for (EACH_IN(elem, _it))
             {
                 assert(*(size_t *)elem == expected_step[i]);
                 i++;
             }
+
+            AdapterIter_drop(&_it);
 
             assert(i == 3);
         }
