@@ -41,3 +41,5 @@ in the whole project
     add capability validation
     add pre written behavior for primitive types (hash, eq, etc.) 
     add asserts (null from malloc)
+    split main.c into separate files
+    improve tests
