@@ -1,0 +1,43 @@
+in Regex
+    change split history to specialized bitset 
+    change visited buffers to bitsets
+    improve tests (nested parens, empty string etc.)
+    add . operator
+    review utf-8 support
+
+add Graph
+add BigNum
+
+in HashMap and HashSet
+    add SipHashHasher
+    
+in Vec
+    review growing strategy
+
+in Iterator
+    review iterator composition
+    add enumerate()
+    add collect()
+    add cycle()
+
+in Vec
+    add chunks()
+
+in String
+    review get()
+    add chars
+    add to_lowercase
+    add to_uppercase
+    add trim_start
+    add trim_end
+    add starts_with
+    add ends_with
+    review utf-8 support and checks
+
+in the whole project
+    generic method macros
+    review pointer semantics
+    add generic type props
+    add capability validation
+    add pre written behavior for primitive types (hash, eq, etc.) 
+    add asserts (null from malloc)
