@@ -4197,8 +4197,11 @@ typedef enum
     TOKEN_KIND_CONCATENATION,
     TOKEN_KIND_ALTERNATION,
     TOKEN_KIND_ZERO_OR_ONE,
+    TOKEN_KIND_LAZY_ZERO_OR_ONE,
     TOKEN_KIND_ZERO_OR_MORE,
+    TOKEN_KIND_LAZY_ZERO_OR_MORE,
     TOKEN_KIND_ONE_OR_MORE,
+    TOKEN_KIND_LAZY_ONE_OR_MORE,
     TOKEN_KIND_LEFT_PARENS,
     TOKEN_KIND_RIGHT_PARENS,
 } TokenKind;
@@ -4216,204 +4219,11 @@ typedef struct
     };
 } Token;
 
-bool Regex_can_start_expr(const Token *token)
-{
-    switch (token->kind)
-    {
-    case TOKEN_KIND_LITERAL:
-    case TOKEN_KIND_LEFT_PARENS:
-        return true;
-
-    default:
-        return false;
-    }
-}
-
-bool Regex_can_end_expr(const Token *token)
-{
-    switch (token->kind)
-    {
-    case TOKEN_KIND_LITERAL:
-    case TOKEN_KIND_RIGHT_PARENS:
-    case TOKEN_KIND_ZERO_OR_ONE:
-    case TOKEN_KIND_ZERO_OR_MORE:
-    case TOKEN_KIND_ONE_OR_MORE:
-        return true;
-
-    default:
-        return false;
-    }
-}
-
-Vec Regex_tokenize(const String *regex)
-{
-    Vec tokens;
-    Vec_new(&tokens, sizeof(Token), &(VecElementOps){});
-
-    for (size_t i = 0; i < String_len(regex); i++)
-    {
-        switch (String_get(regex, i))
-        {
-        case '|':
-            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ALTERNATION});
-            break;
-
-        case '?':
-            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ZERO_OR_ONE});
-            break;
-
-        case '*':
-            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ZERO_OR_MORE});
-            break;
-
-        case '+':
-            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ONE_OR_MORE});
-            break;
-
-        case '(':
-            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_LEFT_PARENS});
-            break;
-
-        case ')':
-            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_RIGHT_PARENS});
-            break;
-
-        case '\\':
-        {
-            i += 1;
-
-            Vec_push(
-                &tokens,
-                &(Token){
-                    .kind = TOKEN_KIND_LITERAL,
-                    .literal = {
-                        .c = String_get(regex, i),
-                    },
-                });
-        }
-        break;
-
-        default:
-        {
-            Vec_push(
-                &tokens,
-                &(Token){
-                    .kind = TOKEN_KIND_LITERAL,
-                    .literal = {
-                        .c = String_get(regex, i),
-                    },
-                });
-        }
-        }
-    }
-
-    // insert concatenation markers
-
-    for (size_t i = 1; i < Vec_len(&tokens); i++)
-    {
-        if (Regex_can_end_expr(Vec_get(&tokens, i - 1)) && Regex_can_start_expr(Vec_get(&tokens, i)))
-        {
-            Vec_insert(&tokens, i, &(Token){.kind = TOKEN_KIND_CONCATENATION});
-            i += 1;
-        }
-    }
-
-    return tokens;
-}
-
-size_t Regex_get_oper_precedence(const Token *token)
-{
-    switch (token->kind)
-    {
-    case TOKEN_KIND_ZERO_OR_ONE:
-    case TOKEN_KIND_ZERO_OR_MORE:
-    case TOKEN_KIND_ONE_OR_MORE:
-        return 3;
-
-    case TOKEN_KIND_CONCATENATION:
-        return 2;
-
-    case TOKEN_KIND_ALTERNATION:
-        return 1;
-
-    default:
-        assert(false);
-        return 0;
-    }
-}
-
-Vec Regex_to_postfix(const Vec *tokens)
-{
-    VecDeque stack;
-    VecDeque_new(&stack, &(VecDequeElementProps){.size = sizeof(Token)});
-
-    Vec postfix;
-    Vec_new(&postfix, sizeof(Token), &(VecElementOps){});
-
-    for (size_t i = 0; i < Vec_len(tokens); i++)
-    {
-        const Token *token = Vec_get(tokens, i);
-
-        switch (token->kind)
-        {
-        case TOKEN_KIND_LITERAL:
-            Vec_push(&postfix, token);
-            break;
-
-        case TOKEN_KIND_LEFT_PARENS:
-            VecDeque_push_back(&stack, token);
-            break;
-
-        case TOKEN_KIND_RIGHT_PARENS:
-        {
-            const Token *back = VecDeque_back(&stack);
-
-            while (back->kind != TOKEN_KIND_LEFT_PARENS)
-            {
-                Vec_push(&postfix, back);
-
-                VecDeque_pop_back(&stack);
-            }
-
-            VecDeque_pop_back(&stack);
-        }
-        break;
-
-        default:
-        {
-            for (const Token *back = VecDeque_back(&stack); back != NULL; back = VecDeque_back(&stack))
-            {
-                if ((Regex_get_oper_precedence(back) < Regex_get_oper_precedence(token)))
-                {
-                    break;
-                }
-
-                Vec_push(&postfix, back);
-
-                VecDeque_pop_back(&stack);
-            }
-
-            VecDeque_push_back(&stack, token);
-        }
-        }
-    }
-
-    for (const Token *back = VecDeque_back(&stack); back != NULL; back = VecDeque_back(&stack))
-    {
-        Vec_push(&postfix, back);
-
-        VecDeque_pop_back(&stack);
-    }
-
-    VecDeque_drop(&stack);
-
-    return postfix;
-}
-
 typedef enum
 {
     STATE_KIND_LITERAL,
     STATE_KIND_SPLIT,
+    STATE_KIND_TAG,
     STATE_KIND_MATCH,
 } StateKind;
 
@@ -4434,6 +4244,13 @@ typedef struct _State
             struct _State *out1;
             struct _State *out2;
         } split;
+
+        struct
+        {
+            size_t id;
+            bool is_start;
+            struct _State *out;
+        } tag;
     };
 } State;
 
@@ -4476,25 +4293,271 @@ typedef struct
 {
     Vec states;
     State *start;
+    size_t tag_count;
     size_t match_idx;
 } NFA;
 
-typedef struct
+bool NFA_can_start_expr(const Token *token)
 {
-    NFA nfa;
-} Regex;
+    switch (token->kind)
+    {
+    case TOKEN_KIND_LITERAL:
+    case TOKEN_KIND_LEFT_PARENS:
+        return true;
 
-NFA Regex_build_nfa(const Vec *tokens)
+    default:
+        return false;
+    }
+}
+
+bool NFA_can_end_expr(const Token *token)
 {
-    Vec states;
-    Vec_with_capacity(&states, sizeof(State), &(VecElementOps){}, Vec_len(tokens) + 1);
+    switch (token->kind)
+    {
+    case TOKEN_KIND_LITERAL:
+    case TOKEN_KIND_RIGHT_PARENS:
+    case TOKEN_KIND_ZERO_OR_ONE:
+    case TOKEN_KIND_LAZY_ZERO_OR_ONE:
+    case TOKEN_KIND_ZERO_OR_MORE:
+    case TOKEN_KIND_LAZY_ZERO_OR_MORE:
+    case TOKEN_KIND_ONE_OR_MORE:
+    case TOKEN_KIND_LAZY_ONE_OR_MORE:
+        return true;
 
-    VecDeque fragment_stack;
-    VecDeque_new(&fragment_stack, &(VecDequeElementProps){.size = sizeof(Fragment)});
+    default:
+        return false;
+    }
+}
+
+size_t NFA_get_oper_precedence(const Token *token)
+{
+    switch (token->kind)
+    {
+    case TOKEN_KIND_ZERO_OR_ONE:
+    case TOKEN_KIND_LAZY_ZERO_OR_ONE:
+    case TOKEN_KIND_ZERO_OR_MORE:
+    case TOKEN_KIND_LAZY_ZERO_OR_MORE:
+    case TOKEN_KIND_ONE_OR_MORE:
+    case TOKEN_KIND_LAZY_ONE_OR_MORE:
+        return 3;
+
+    case TOKEN_KIND_CONCATENATION:
+        return 2;
+
+    case TOKEN_KIND_ALTERNATION:
+        return 1;
+
+    default:
+        assert(false);
+        return 0;
+    }
+}
+
+Vec NFA_to_postfix(Vec *tokens)
+{
+    VecDeque stack;
+    VecDeque_new(&stack, &(VecDequeElementProps){.size = sizeof(Token)});
+
+    Vec postfix;
+    Vec_new(&postfix, sizeof(Token), &(VecElementOps){});
 
     for (size_t i = 0; i < Vec_len(tokens); i++)
     {
         const Token *token = Vec_get(tokens, i);
+
+        switch (token->kind)
+        {
+        case TOKEN_KIND_LITERAL:
+            Vec_push(&postfix, token);
+            break;
+
+        case TOKEN_KIND_LEFT_PARENS:
+        {
+            Vec_push(&postfix, token);
+            VecDeque_push_back(&stack, token);
+        }
+        break;
+
+        case TOKEN_KIND_RIGHT_PARENS:
+        {
+            const Token *back = VecDeque_back(&stack);
+
+            while (back != NULL && back->kind != TOKEN_KIND_LEFT_PARENS)
+            {
+                Vec_push(&postfix, back);
+
+                VecDeque_pop_back(&stack);
+                back = VecDeque_back(&stack);
+            }
+
+            VecDeque_pop_back(&stack);
+
+            Vec_push(&postfix, token);
+        }
+        break;
+
+        default:
+        {
+            for (const Token *back = VecDeque_back(&stack); back != NULL && back->kind != TOKEN_KIND_LEFT_PARENS; back = VecDeque_back(&stack))
+            {
+                if ((NFA_get_oper_precedence(back) < NFA_get_oper_precedence(token)))
+                {
+                    break;
+                }
+
+                Vec_push(&postfix, back);
+
+                VecDeque_pop_back(&stack);
+            }
+
+            VecDeque_push_back(&stack, token);
+        }
+        }
+    }
+
+    for (const Token *back = VecDeque_back(&stack); back != NULL; back = VecDeque_back(&stack))
+    {
+        Vec_push(&postfix, back);
+
+        VecDeque_pop_back(&stack);
+    }
+
+    VecDeque_drop(&stack);
+
+    return postfix;
+}
+
+Vec NFA_tokenize(const String *regex)
+{
+    Vec tokens;
+    Vec_new(&tokens, sizeof(Token), &(VecElementOps){});
+
+    for (size_t i = 0; i < String_len(regex); i++)
+    {
+        switch (String_get(regex, i))
+        {
+        case '|':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ALTERNATION});
+            break;
+
+        case '?':
+        {
+            bool is_lazy = i + 1 < String_len(regex) && String_get(regex, i + 1) == '?';
+
+            if (is_lazy)
+            {
+                Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_LAZY_ZERO_OR_ONE});
+                i += 1;
+            }
+            else
+            {
+                Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ZERO_OR_ONE});
+            }
+        }
+        break;
+
+        case '*':
+        {
+            bool is_lazy = i + 1 < String_len(regex) && String_get(regex, i + 1) == '?';
+
+            if (is_lazy)
+            {
+                Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_LAZY_ZERO_OR_MORE});
+                i += 1;
+            }
+            else
+            {
+                Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ZERO_OR_MORE});
+            }
+        }
+        break;
+
+        case '+':
+        {
+            bool is_lazy = i + 1 < String_len(regex) && String_get(regex, i + 1) == '?';
+
+            if (is_lazy)
+            {
+                Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_LAZY_ONE_OR_MORE});
+                i += 1;
+            }
+            else
+            {
+                Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_ONE_OR_MORE});
+            }
+        }
+        break;
+
+        case '(':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_LEFT_PARENS});
+            break;
+
+        case ')':
+            Vec_push(&tokens, &(Token){.kind = TOKEN_KIND_RIGHT_PARENS});
+            break;
+
+        case '\\':
+        {
+            i += 1;
+
+            Vec_push(
+                &tokens,
+                &(Token){
+                    .kind = TOKEN_KIND_LITERAL,
+                    .literal = {
+                        .c = String_get(regex, i),
+                    },
+                });
+        }
+        break;
+
+        default:
+        {
+            Vec_push(
+                &tokens,
+                &(Token){
+                    .kind = TOKEN_KIND_LITERAL,
+                    .literal = {
+                        .c = String_get(regex, i),
+                    },
+                });
+        }
+        }
+    }
+
+    // insert concatenation markers
+
+    for (size_t i = 1; i < Vec_len(&tokens); i++)
+    {
+        if (NFA_can_end_expr(Vec_get(&tokens, i - 1)) && NFA_can_start_expr(Vec_get(&tokens, i)))
+        {
+            Vec_insert(&tokens, i, &(Token){.kind = TOKEN_KIND_CONCATENATION});
+            i += 1;
+        }
+    }
+
+    Vec postfix = NFA_to_postfix(&tokens);
+
+    Vec_drop(&tokens);
+
+    return postfix;
+}
+
+NFA NFA_from_str(const String *str)
+{
+    Vec tokens = NFA_tokenize(str);
+
+    Vec states;
+    Vec_with_capacity(&states, sizeof(State), &(VecElementOps){}, Vec_len(&tokens) + 1);
+
+    VecDeque fragment_stack;
+    VecDeque_new(&fragment_stack, &(VecDequeElementProps){.size = sizeof(Fragment)});
+
+    size_t tag_count = 0;
+
+    for (size_t i = 0; i < Vec_len(&tokens); i++)
+    {
+        const Token *token = Vec_get(&tokens, i);
 
         switch (token->kind)
         {
@@ -4516,6 +4579,64 @@ NFA Regex_build_nfa(const Vec *tokens)
                 &(Fragment){
                     .start = new,
                     .out_list = OutList_new((State **)&new->literal.out),
+                });
+        }
+        break;
+
+        case TOKEN_KIND_LEFT_PARENS:
+        {
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_TAG,
+                    .tag = {
+                        .id = tag_count,
+                        .is_start = true,
+                    },
+                });
+
+            tag_count += 1;
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = new,
+                    .out_list = OutList_new((State **)&new->tag.out),
+                });
+        }
+        break;
+
+        case TOKEN_KIND_RIGHT_PARENS:
+        {
+            Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Fragment start_tag = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            OutList_patch(start_tag.out_list, frag.start);
+
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_TAG,
+                    .tag = {
+                        .id = start_tag.start->tag.id,
+                        .is_start = false,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            OutList_patch(frag.out_list, new);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = start_tag.start,
+                    .out_list = OutList_new((State **)&new->tag.out),
                 });
         }
         break;
@@ -4593,6 +4714,31 @@ NFA Regex_build_nfa(const Vec *tokens)
         }
         break;
 
+        case TOKEN_KIND_LAZY_ZERO_OR_ONE:
+        {
+            Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_SPLIT,
+                    .split = {
+                        .out2 = frag.start,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = new,
+                    .out_list = OutList_append(frag.out_list, OutList_new(&new->split.out1)),
+                });
+        }
+        break;
+
         case TOKEN_KIND_ZERO_OR_MORE:
         {
             Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
@@ -4616,6 +4762,33 @@ NFA Regex_build_nfa(const Vec *tokens)
                 &(Fragment){
                     .start = new,
                     .out_list = OutList_new(&new->split.out2),
+                });
+        }
+        break;
+
+        case TOKEN_KIND_LAZY_ZERO_OR_MORE:
+        {
+            Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_SPLIT,
+                    .split = {
+                        .out2 = frag.start,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            OutList_patch(frag.out_list, new);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = new,
+                    .out_list = OutList_new(&new->split.out1),
                 });
         }
         break;
@@ -4647,6 +4820,33 @@ NFA Regex_build_nfa(const Vec *tokens)
         }
         break;
 
+        case TOKEN_KIND_LAZY_ONE_OR_MORE:
+        {
+            Fragment frag = *(Fragment *)VecDeque_back(&fragment_stack);
+            VecDeque_pop_back(&fragment_stack);
+
+            Vec_push(
+                &states,
+                &(State){
+                    .kind = STATE_KIND_SPLIT,
+                    .split = {
+                        .out2 = frag.start,
+                    },
+                });
+
+            State *new = Vec_get_mut(&states, Vec_len(&states) - 1);
+
+            OutList_patch(frag.out_list, new);
+
+            VecDeque_push_back(
+                &fragment_stack,
+                &(Fragment){
+                    .start = frag.start,
+                    .out_list = OutList_new(&new->split.out1),
+                });
+        }
+        break;
+
         default:
             assert(false);
         }
@@ -4662,91 +4862,278 @@ NFA Regex_build_nfa(const Vec *tokens)
     return (NFA){
         .states = states,
         .start = frag.start,
+        .tag_count = tag_count,
         .match_idx = match_idx,
     };
 }
 
+size_t NFA_state_idx(NFA *this, State *state)
+{
+    return ((uint8_t *)(state) - (uint8_t *)(Vec_get(&this->states, 0))) / this->states.element_size;
+}
+
+void NFA_drop(NFA *this)
+{
+    Vec_drop(&this->states);
+}
+
+typedef struct
+{
+    NFA nfa;
+} Regex;
+
 Regex Regex_new(const String *regex)
 {
-    Vec tokens = Regex_tokenize(regex);
-    Vec postfix = Regex_to_postfix(&tokens);
-    Vec_drop(&tokens);
-
     return (Regex){
-        .nfa = Regex_build_nfa(&postfix),
+        .nfa = NFA_from_str(regex),
     };
 }
 
-size_t Regex_state_idx(Regex *this, State *state)
+typedef struct
 {
-    return ((uint8_t *)(state) - (uint8_t *)(Vec_get(&this->nfa.states, 0))) / sizeof(State);
-}
+    size_t start;
+    size_t end;
+} Capture;
 
-void Regex_add_state(Regex *this, Vec *list, State *state)
+typedef struct
 {
-    size_t i = Regex_state_idx(this, state);
-    bool *slot = (bool *)Vec_get_mut(list, i);
+    uint8_t *splits;
+    size_t split_count;
+    size_t split_capacity;
+    Capture *tags;
+    size_t tag_capacity;
+} ThreadHistory;
 
-    if (*slot == true)
-    {
-        return;
-    }
-
-    *slot = true;
-
-    if (state->kind == STATE_KIND_SPLIT)
-    {
-        Regex_add_state(this, list, state->split.out1);
-        Regex_add_state(this, list, state->split.out2);
-    }
-}
-
-void Regex_step(Regex *this, Vec *current_list, uint8_t c, Vec *next_list)
+typedef struct
 {
-    memset(Vec_get_mut(next_list, 0), 0, Vec_len(next_list) * sizeof(bool));
+    State *state;
+    ThreadHistory history;
+} Thread;
 
-    for (size_t i = 0; i < Vec_len(current_list); i++)
+Thread Thread_new(State *state, size_t tag_capacity)
+{
+    Thread this = {
+        .state = state,
+    };
+
+    this.history.split_count = 0;
+    this.history.split_capacity = 64;
+    this.history.splits = malloc(this.history.split_capacity * sizeof(this.history.splits));
+
+    this.history.tag_capacity = tag_capacity;
+
+    if (tag_capacity)
     {
-        if (*(bool *)Vec_get(current_list, i) == true)
+        this.history.tags = malloc(this.history.tag_capacity * sizeof(*this.history.tags));
+
+        for (size_t i = 0; i < this.history.tag_capacity; i++)
         {
-            State *state = (State *)Vec_get(&this->nfa.states, i);
-
-            if (state->kind == STATE_KIND_LITERAL && c == state->literal.c)
-            {
-                Regex_add_state(this, next_list, state->literal.out);
-            }
+            this.history.tags[i].start = SIZE_MAX;
+            this.history.tags[i].end = SIZE_MAX;
         }
     }
+
+    return this;
 }
 
-bool Regex_has_match(Regex *this, Vec *current_list)
+Thread Thread_clone(const Thread *other)
 {
-    return *(bool *)Vec_get(current_list, this->nfa.match_idx) == true;
+    Thread this = {
+        .state = other->state,
+        .history = {
+            .split_count = other->history.split_count,
+            .split_capacity = other->history.split_capacity,
+            .tag_capacity = other->history.tag_capacity,
+        },
+    };
+
+    this.history.splits = malloc(this.history.split_capacity * sizeof(this.history.splits));
+    memcpy(this.history.splits, other->history.splits, other->history.split_count * sizeof(this.history.splits));
+
+    if (this.history.tag_capacity)
+    {
+        this.history.tags = malloc(this.history.tag_capacity * sizeof(*this.history.tags));
+        memcpy(this.history.tags, other->history.tags, other->history.tag_capacity * sizeof(*this.history.tags));
+    }
+
+    return this;
 }
 
-bool Regex_is_match(Regex *this, const String *str)
+void Thread_push_split(Thread *this, uint8_t split)
 {
+    if (this->history.split_count == this->history.split_capacity)
+    {
+        this->history.split_capacity *= 2;
+        this->history.splits = realloc(this->history.splits, this->history.split_capacity * sizeof(*this->history.splits));
+    }
+
+    this->history.splits[this->history.split_count] = split;
+    this->history.split_count += 1;
+}
+
+bool Thread_new_is_better(const Thread *this, const Thread *new)
+{
+    for (size_t i = 0; i < this->history.split_count; i++)
+    {
+        if (new->history.splits[i] > this->history.splits[i])
+        {
+            return true;
+        }
+        else if (new->history.splits[i] < this->history.splits[i])
+        {
+            return false;
+        }
+    }
+
+    // prevent cycles as in (.?)*:
+    //
+    // Split₀
+    // ├── out1 → Split₁
+    // │           ├── out1 → '.' → back to Split₀
+    // │           └── out2 → back to Split₀
+    // └── out2 → Match
+    //
+    // when the e-closure cycles back to the original state, it will have the original state's history as it's prefix. We see this and keep
+    // the original state. Since the e-closure computes the concrete states reachable from the original state and it is already being processed
+    // earlier in the e-closure, we can simply discard the recursive call
+
+    return false;
+}
+
+void Thread_set_tag(Thread *this, size_t id, bool is_start, size_t pos)
+{
+    if (is_start)
+    {
+        this->history.tags[id].start = pos;
+    }
+    else
+    {
+        this->history.tags[id].end = pos;
+    }
+}
+
+void Thread_drop(Thread *this)
+{
+    free(this->history.splits);
+
+    if (this->history.tag_capacity)
+    {
+        free(this->history.tags);
+    }
+}
+
+void Regex_e_closure(Regex *this, size_t pos, Thread *new, Vec *visited, Vec *list)
+{
+    size_t idx = NFA_state_idx(&this->nfa, new->state);
+    uint8_t *already_visited = (uint8_t *)Vec_get_mut(visited, idx);
+
+    if (*already_visited == 1)
+    {
+        Thread *old = (Thread *)Vec_get_mut(list, idx);
+
+        if (Thread_new_is_better(old, new))
+        {
+            Thread_drop(old);
+        }
+        else
+        {
+            Thread_drop(new);
+            return;
+        }
+    }
+
+    *already_visited = 1;
+    *(Thread *)Vec_get_mut(list, idx) = *new;
+
+    switch (new->state->kind)
+    {
+    case STATE_KIND_SPLIT:
+    {
+        Thread t1 = Thread_clone(new);
+        t1.state = new->state->split.out1;
+        Thread_push_split(&t1, 1);
+        Regex_e_closure(this, pos, &t1, visited, list);
+
+        Thread t2 = Thread_clone(new);
+        t2.state = new->state->split.out2;
+        Thread_push_split(&t2, 0);
+        Regex_e_closure(this, pos, &t2, visited, list);
+    }
+    break;
+
+    case STATE_KIND_TAG:
+    {
+        Thread t = Thread_clone(new);
+        t.state = new->state->tag.out;
+        Thread_set_tag(&t, new->state->tag.id, new->state->tag.is_start, pos);
+        Regex_e_closure(this, pos, &t, visited, list);
+    }
+    break;
+
+    default:
+        break;
+    }
+}
+
+void Regex_step(Regex *this, size_t pos, uint8_t c, Vec *current_visited, Vec *current_list, Vec *next_visited, Vec *next_list)
+{
+    memset(Vec_get_mut(next_visited, 0), 0, Vec_len(next_visited) * sizeof(uint8_t));
+
+    for (size_t i = 0; i < Vec_len(current_visited); i++)
+    {
+        if (*(uint8_t *)Vec_get(current_visited, i) == 1)
+        {
+            Thread *t = (Thread *)Vec_get(current_list, i);
+
+            if (t->state->kind == STATE_KIND_LITERAL && c == t->state->literal.c)
+            {
+                Thread new = Thread_clone(t);
+                new.state = t->state->literal.out;
+                Regex_e_closure(this, pos, &new, next_visited, next_list);
+            }
+
+            Thread_drop(t);
+        }
+    }
+
+    SWAP(*current_list, *next_list);
+    SWAP(*current_visited, *next_visited);
+}
+
+bool Regex_match(Regex *this, const String *str, Vec *captures)
+{
+    size_t state_count = Vec_len(&this->nfa.states);
+
     Vec current_list;
-    Vec_with_capacity(&current_list, sizeof(bool), &(VecElementOps){}, Vec_len(&this->nfa.states));
-    Vec_set_len(&current_list, Vec_len(&this->nfa.states));
+    Vec_with_capacity(&current_list, sizeof(Thread), &(VecElementOps){}, state_count);
+    Vec_set_len(&current_list, state_count);
+
+    Vec current_visited;
+    Vec_with_capacity(&current_visited, sizeof(uint8_t), &(VecElementOps){}, state_count);
+    Vec_set_len(&current_visited, state_count);
 
     Vec next_list;
-    Vec_with_capacity(&next_list, sizeof(bool), &(VecElementOps){}, Vec_len(&this->nfa.states));
-    Vec_set_len(&next_list, Vec_len(&this->nfa.states));
+    Vec_with_capacity(&next_list, sizeof(Thread), &(VecElementOps){}, state_count);
+    Vec_set_len(&next_list, state_count);
 
-    memset(Vec_get_mut(&current_list, 0), 0, Vec_len(&current_list) * sizeof(bool));
-    Regex_add_state(this, &current_list, this->nfa.start);
+    Vec next_visited;
+    Vec_with_capacity(&next_visited, sizeof(uint8_t), &(VecElementOps){}, state_count);
+    Vec_set_len(&next_visited, state_count);
+
+    memset(Vec_get_mut(&current_visited, 0), 0, Vec_len(&current_visited) * sizeof(uint8_t));
+
+    Thread start = Thread_new(this->nfa.start, this->nfa.tag_count);
+    Regex_e_closure(this, 0, &start, &current_visited, &current_list);
 
     for (size_t i = 0; i < String_len(str); i++)
     {
         uint8_t c = String_get(str, i);
-        Regex_step(this, &current_list, c, &next_list);
+        Regex_step(this, i + 1, c, &current_visited, &current_list, &next_visited, &next_list);
 
         bool has_any = false;
-
-        for (size_t i = 0; i < Vec_len(&next_list); i++)
+        for (size_t j = 0; j < Vec_len(&current_visited); j++)
         {
-            if (*(bool *)Vec_get(&next_list, i) == true)
+            if (*(uint8_t *)Vec_get(&current_visited, j) == 1)
             {
                 has_any = true;
                 break;
@@ -4757,21 +5144,33 @@ bool Regex_is_match(Regex *this, const String *str)
         {
             break;
         }
-
-        SWAP(current_list, next_list);
     }
 
-    bool is_match = Regex_has_match(this, &current_list);
+    bool has_match = *(uint8_t *)Vec_get(&current_visited, this->nfa.match_idx) == 1;
+
+    if (has_match && this->nfa.tag_count != 0)
+    {
+        Vec_with_capacity(captures, sizeof(Capture), &(VecElementOps){}, this->nfa.tag_count);
+
+        const Thread *thread = Vec_get(&current_list, this->nfa.match_idx);
+
+        for (size_t j = 0; j < this->nfa.tag_count; j++)
+        {
+            Vec_push(captures, &thread->history.tags[j]);
+        }
+    }
 
     Vec_drop(&current_list);
+    Vec_drop(&current_visited);
     Vec_drop(&next_list);
+    Vec_drop(&next_visited);
 
-    return is_match;
+    return has_match;
 }
 
 void Regex_drop(Regex *this)
 {
-    Vec_drop(&this->nfa.states);
+    NFA_drop(&this->nfa);
 }
 
 bool eq_u8(const uint8_t *a, const uint8_t *b)
@@ -4807,16 +5206,6 @@ void drop_nop(void *ptr)
 
 int main(int argc, const char **argv)
 {
-    String str;
-    String_from(&str, Str_from_cstr("a?b+c"));
-    Regex regex = Regex_new(&str);
-    String haystack;
-    String_from(&haystack, Str_from_cstr("bbbbc"));
-    assert(Regex_is_match(&regex, &haystack));
-    String_drop(&str);
-    String_drop(&haystack);
-    Regex_drop(&regex);
-
     {
         Vec u8vec;
         Vec_new(&u8vec, sizeof(uint8_t), NULL);
@@ -5778,6 +6167,90 @@ int main(int argc, const char **argv)
         }
 
         Vec_drop(&v);
+    }
+
+    {
+        String str;
+        String_from(&str, Str_from_cstr("a?b+c"));
+        Regex regex = Regex_new(&str);
+        String haystack;
+        String_from(&haystack, Str_from_cstr("bbbbc"));
+
+        Vec captures;
+        assert(Regex_match(&regex, &haystack, &captures));
+
+        String_drop(&str);
+        String_drop(&haystack);
+        Regex_drop(&regex);
+    }
+
+    {
+        String str;
+        String_from(&str, Str_from_cstr("a+?(a*)"));
+        Regex regex = Regex_new(&str);
+        String haystack;
+        String_from(&haystack, Str_from_cstr("aaa"));
+
+        Vec captures;
+        assert(Regex_match(&regex, &haystack, &captures));
+
+        assert(Vec_len(&captures) == 1);
+        Capture *a = Vec_get_mut(&captures, 0);
+        assert(a->start == 1 && a->end == 3);
+
+        Vec_drop(&captures);
+    }
+
+    {
+        String str;
+        String_from(&str, Str_from_cstr("(a+)a*"));
+        Regex regex = Regex_new(&str);
+        String haystack;
+        String_from(&haystack, Str_from_cstr("aaa"));
+
+        Vec captures;
+        assert(Regex_match(&regex, &haystack, &captures));
+
+        assert(Vec_len(&captures) == 1);
+        Capture *a = Vec_get_mut(&captures, 0);
+        assert(a->start == 0 && a->end == 3);
+
+        Vec_drop(&captures);
+    }
+
+    {
+        String str;
+        String_from(&str, Str_from_cstr("a*(b+)(c+)"));
+        Regex regex = Regex_new(&str);
+        String haystack;
+        String_from(&haystack, Str_from_cstr("aaabc"));
+
+        Vec captures;
+        assert(Regex_match(&regex, &haystack, &captures));
+
+        assert(Vec_len(&captures) == 2);
+        Capture *a = Vec_get_mut(&captures, 0);
+        assert(a->start == 3 && a->end == 4);
+        a = Vec_get_mut(&captures, 1);
+        assert(a->start == 4 && a->end == 5);
+
+        Vec_drop(&captures);
+
+        String_drop(&haystack);
+        String_from(&haystack, Str_from_cstr("aaabbcc"));
+        assert(Regex_match(&regex, &haystack, &captures));
+
+        assert(Vec_len(&captures) == 2);
+        a = Vec_get_mut(&captures, 0);
+        assert(a->start == 3 && a->end == 5);
+        a = Vec_get_mut(&captures, 1);
+        assert(a->start == 5 && a->end == 7);
+
+        Vec_drop(&captures);
+
+        String_drop(&str);
+        String_drop(&haystack);
+        Regex_drop(&regex);
     }
 
     return 0;
