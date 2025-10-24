@@ -5168,6 +5168,114 @@ bool Regex_match(Regex *this, const String *str, Vec *captures)
     return has_match;
 }
 
+void Regex_search(Regex *this, const String *str, size_t *match_start, size_t *match_end, Vec *captures)
+{
+    size_t state_count = Vec_len(&this->nfa.states);
+
+    Vec current_list;
+    Vec_with_capacity(&current_list, sizeof(Thread), &(VecElementOps){}, state_count);
+    Vec_set_len(&current_list, state_count);
+
+    Vec current_visited;
+    Vec_with_capacity(&current_visited, sizeof(uint8_t), &(VecElementOps){}, state_count);
+    Vec_set_len(&current_visited, state_count);
+
+    Vec next_list;
+    Vec_with_capacity(&next_list, sizeof(Thread), &(VecElementOps){}, state_count);
+    Vec_set_len(&next_list, state_count);
+
+    Vec next_visited;
+    Vec_with_capacity(&next_visited, sizeof(uint8_t), &(VecElementOps){}, state_count);
+    Vec_set_len(&next_visited, state_count);
+
+    for (size_t s = 0; s < String_len(str); s++)
+    {
+        memset(Vec_get_mut(&current_visited, 0), 0, Vec_len(&current_visited) * sizeof(uint8_t));
+
+        Thread best_match;
+        size_t best_match_end;
+        bool has_best_match = false;
+
+        Thread start = Thread_new(this->nfa.start, this->nfa.tag_count);
+        Regex_e_closure(this, s, &start, &current_visited, &current_list);
+
+        bool has_match = *(uint8_t *)Vec_get(&current_visited, this->nfa.match_idx) == 1;
+
+        if (has_match)
+        {
+            best_match = Thread_clone(Vec_get(&current_list, this->nfa.match_idx));
+            best_match_end = s;
+        }
+
+        for (size_t i = s; i < String_len(str); i++)
+        {
+            uint8_t c = String_get(str, i);
+            Regex_step(this, i + 1, c, &current_visited, &current_list, &next_visited, &next_list);
+
+            bool has_any = false;
+            for (size_t j = 0; j < Vec_len(&current_visited); j++)
+            {
+                if (*(uint8_t *)Vec_get(&current_visited, j) == 1)
+                {
+                    has_any = true;
+                    break;
+                }
+            }
+
+            if (!has_any)
+            {
+                break;
+            }
+
+            has_match = *(uint8_t *)Vec_get(&current_visited, this->nfa.match_idx) == 1;
+
+            if (has_match)
+            {
+                const Thread *new = Vec_get(&current_list, this->nfa.match_idx);
+
+                if (has_best_match)
+                {
+                    if (Thread_new_is_better(&best_match, new))
+                    {
+                        Thread_drop(&best_match);
+
+                        best_match = Thread_clone(new);
+                        best_match_end = i + 1;
+                    }
+                }
+                else
+                {
+                    has_best_match = true;
+                    best_match = Thread_clone(new);
+                    best_match_end = i + 1;
+                }
+            }
+        }
+
+        if (has_best_match)
+        {
+            *match_start = s;
+            *match_end = best_match_end;
+
+            Vec_with_capacity(captures, sizeof(Capture), &(VecElementOps){}, this->nfa.tag_count);
+
+            for (size_t j = 0; j < this->nfa.tag_count; j++)
+            {
+                Vec_push(captures, &best_match.history.tags[j]);
+            }
+
+            Thread_drop(&best_match);
+
+            break;
+        }
+    }
+
+    Vec_drop(&current_list);
+    Vec_drop(&current_visited);
+    Vec_drop(&next_list);
+    Vec_drop(&next_visited);
+}
+
 void Regex_drop(Regex *this)
 {
     NFA_drop(&this->nfa);
@@ -6247,6 +6355,53 @@ int main(int argc, const char **argv)
         assert(a->start == 5 && a->end == 7);
 
         Vec_drop(&captures);
+
+        String_drop(&str);
+        String_drop(&haystack);
+        Regex_drop(&regex);
+    }
+
+    {
+        String str;
+        String_from(&str, Str_from_cstr("b+"));
+        Regex regex = Regex_new(&str);
+        String haystack;
+        String_from(&haystack, Str_from_cstr("aabbbc"));
+
+        Vec captures;
+        size_t start = SIZE_MAX;
+        size_t end = SIZE_MAX;
+        Regex_search(&regex, &haystack, &start, &end, &captures);
+
+        assert(start == 2 && end == 5);
+
+        String_drop(&haystack);
+        String_from(&haystack, Str_from_cstr("aabbb"));
+
+        start = SIZE_MAX;
+        end = SIZE_MAX;
+        Regex_search(&regex, &haystack, &start, &end, &captures);
+
+        assert(start == 2 && end == 5);
+
+        String_drop(&str);
+        String_drop(&haystack);
+        Regex_drop(&regex);
+    }
+
+    {
+        String str;
+        String_from(&str, Str_from_cstr("b+?"));
+        Regex regex = Regex_new(&str);
+        String haystack;
+        String_from(&haystack, Str_from_cstr("aabbbc"));
+
+        Vec captures;
+        size_t start = SIZE_MAX;
+        size_t end = SIZE_MAX;
+        Regex_search(&regex, &haystack, &start, &end, &captures);
+
+        assert(start == 2 && end == 3);
 
         String_drop(&str);
         String_drop(&haystack);
